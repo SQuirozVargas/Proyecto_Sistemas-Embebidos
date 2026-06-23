@@ -1,0 +1,178 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_adc/adc_oneshot.h" 
+#include "esp_log.h"
+#include "esp_timer.h"
+
+static const char *TAG = "SISTEMA_SEGURIDAD";
+
+// 1. DEFINICIÓN DE PINES (ADC1 - COMPATIBLE CON ESP32-S)
+#define CANAL_PULSO      ADC_CHANNEL_0 // GPIO 36 (Pin VP) -> XD-58C
+#define CANAL_BLOQUE_IZQ ADC_CHANNEL_3 // GPIO 39 (Pin VN) -> 2 Piezos Izquierdos
+#define CANAL_BLOQUE_DER ADC_CHANNEL_6 // GPIO 34           -> 2 Piezos Derechos
+
+// 2. CONFIGURACIÓN DEL ALGORITMO INTEGRANDO TUS VALORES EN REPOSO
+// En reposo tu DELTA es ~3359. Si alguien se sienta, este delta cambiará drásticamente.
+#define DELTA_REPOSO         3359
+#define TOLERANCIA_REPOSO    300   // Margen de ruido para el estado vacío
+#define UMBRAL_DESBALANCE    1500  // Umbral de inclinación respecto al estado base
+#define TIEMPO_CRITICO_MS    5000  // 5 segundos para asumir desmayo
+#define PERIODO_MUESTREO_MS  10    // Muestreo rápido a 10ms
+
+// Umbrales para detección de latidos cardíacos (XD-58C)
+#define UMBRAL_PULSO_ALTO    2180  
+#define UMBRAL_PULSO_BAJO    2050  
+
+// Manejador global del ADC1
+adc_oneshot_unit_handle_t adc1_handle;
+
+void inicializar_adc(void) {
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        .clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config_canal = {
+        .bitwidth = ADC_BITWIDTH_12,
+        .atten = ADC_ATTEN_DB_12, 
+    };
+    
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, CANAL_PULSO, &config_canal));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, CANAL_BLOQUE_IZQ, &config_canal));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, CANAL_BLOQUE_DER, &config_canal));
+}
+
+void app_main(void) {
+    inicializar_adc();
+
+    int peso_izq = 0;
+    int peso_der = 0;
+    int valor_pulso = 0;
+    
+    int ciclos_inclinado_izq = 0;
+    int ciclos_inclinado_der = 0;
+    int ciclos_necesarios_desmayo = TIEMPO_CRITICO_MS / PERIODO_MUESTREO_MS;
+
+    bool detectando_latido = false;
+    int64_t tiempo_ultimo_latido = 0;
+    float lpm = 0.0;
+
+    int contador_impresion = 0;
+    bool alguien_sentado = false;
+
+    ESP_LOGI(TAG, "Firmware calibrado con valores de reposo listo.");
+
+    while (1) {
+        // A. Lectura de canales analógicos
+        adc_oneshot_read(adc1_handle, CANAL_PULSO, &valor_pulso);
+        adc_oneshot_read(adc1_handle, CANAL_BLOQUE_IZQ, &peso_izq);
+        adc_oneshot_read(adc1_handle, CANAL_BLOQUE_DER, &peso_der);
+
+        int diferencia_actual = peso_izq - peso_der;
+
+        // B. Filtro de Presencia basado en la desviación del Delta de Reposo
+        // Si el delta actual se desvía de los 3359 estáticos, significa que hay presión física activa
+        if (abs(diferencia_actual - DELTA_REPOSO) > TOLERANCIA_REPOSO) {
+            alguien_sentado = true;
+        } else {
+            alguien_sentado = false;
+            ciclos_inclinado_izq = 0;
+            ciclos_inclinado_der = 0;
+            lpm = 0.0;
+            tiempo_ultimo_latido = 0;
+        }
+
+        // C. Procesar Algoritmos solo si el asiento está ocupado
+        if (alguien_sentado) {
+            
+            // Algoritmo LPM
+            if (valor_pulso > UMBRAL_PULSO_ALTO && !detectando_latido) {
+                detectando_latido = true;
+                int64_t tiempo_actual = esp_timer_get_time();
+                
+                if (tiempo_ultimo_latido > 0) {
+                    int64_t intervalo_us = tiempo_actual - tiempo_ultimo_latido;
+                    float intervalo_s = (float)intervalo_us / 1000000.0;
+                    
+                    if (intervalo_s > 0.35 && intervalo_s < 2.0) {
+                        lpm = 60.0 / intervalo_s;
+                    }
+                }
+                tiempo_ultimo_latido = tiempo_actual;
+            } 
+            else if (valor_pulso < UMBRAL_PULSO_BAJO) {
+                detectando_latido = false;
+            }
+
+            // Algoritmo de Desbalance Postural adaptado al desfase dinámico
+            int variacion_delta = diferencia_actual - DELTA_REPOSO;
+            if (variacion_delta > UMBRAL_DESBALANCE) {
+                ciclos_inclinado_izq++;
+                ciclos_inclinado_der = 0;
+            } else if (variacion_delta < -UMBRAL_DESBALANCE) {
+                ciclos_inclinado_der++;
+                ciclos_inclinado_izq = 0;
+            } else {
+                ciclos_inclinado_izq = 0;
+                ciclos_inclinado_der = 0;
+            }
+        }
+
+        // D. Renderizado de Telemetría en Tabla Serial (Cada 1 segundo)
+        contador_impresion++;
+        if (contador_impresion >= 100) {
+            contador_impresion = 0;
+
+            printf("\e[1;1H\e[2J"); 
+            printf("=============================================================\n");
+            printf("               TELEMETRÍA DEL SISTEMA DE SEGURIDAD           \n");
+            printf("=============================================================\n");
+            
+            if (!alguien_sentado) {
+                printf(" STATUS: [ VACÍO ]\n\n");
+                ESP_LOGW("ASIENTO", "No hay nadie sentado en el vehículo.");
+                printf("=============================================================\n");
+            } else {
+                printf(" STATUS: [ OCUPADO ]\n\n");
+                
+                printf("+--------------------+--------------------+--------------------+\n");
+                printf("| SENSOR IZQUIERDO   | SENSOR DERECHO     | DELTA (DESBALANCE) |\n");
+                printf("+--------------------+--------------------+--------------------+\n");
+                printf("| %-18d | %-18d | %-18d |\n", peso_izq, peso_der, diferencia_actual);
+                printf("+--------------------+--------------------+--------------------+\n");
+                printf("| PULSO (CRUDO)      | LPM (PROCESADO)    |                    |\n");
+                printf("+--------------------+--------------------+--------------------+\n");
+                printf("| %-18d | %-18.1f |                    |\n", valor_pulso, lpm);
+                printf("+--------------------+--------------------+--------------------+\n\n");
+
+                printf(" DIAGNÓSTICO INDUSTRIAL:\n");
+                
+                if (lpm == 0) {
+                    ESP_LOGW("PULSO", "Detectando señal... Coloque el dedo sobre el sensor.");
+                } else if (lpm < 40.0 || lpm > 140.0) {
+                    ESP_LOGE("PULSO", "¡EMERGENCIA MÉDICA! Ritmo crítico: %.1f LPM", lpm);
+                } else if (lpm < 60.0) {
+                    ESP_LOGW("PULSO", "RITMO BAJO (%.1f LPM): Alerta por posible somnolencia.", lpm);
+                } else if (lpm > 100.0) {
+                    ESP_LOGW("PULSO", "RITMO ELEVADO (%.1f LPM): Conductor bajo estrés.", lpm);
+                } else {
+                    ESP_LOGI("PULSO", "RITMO NORMAL (%.1f LPM): Conductor estable.", lpm);
+                }
+
+                if (ciclos_inclinado_izq >= ciclos_necesarios_desmayo) {
+                    ESP_LOGE("COJÍN", "¡ALERTA CRÍTICA! POSIBLE DESMAYO SOBRE LADO IZQUIERDO");
+                } else if (ciclos_inclinado_der >= ciclos_necesarios_desmayo) {
+                    ESP_LOGE("COJÍN", "¡ALERTA CRÍTICA! POSIBLE DESMAYO SOBRE LADO DERECHO");
+                } else {
+                    ESP_LOGI("COJÍN", "Postura correcta / centrada.");
+                }
+                printf("=============================================================\n");
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(PERIODO_MUESTREO_MS));
+    }
+}
