@@ -1,0 +1,261 @@
+#include <Arduino.h>
+#include "apwifieeprommode.h"
+#include "telegram.h"
+#include "database.h"
+#include <EEPROM.h>
+#include <HardwareSerial.h>
+#include <TinyGPS++.h>
+
+// ===== PINES DISPLAY 7 SEGMENTOS =====
+#define SEG_A 13
+#define SEG_B 32
+#define SEG_C 14
+#define SEG_D 27
+#define SEG_E 26
+#define SEG_F 25
+#define SEG_G 33
+
+// ===== PINES LEDs =====
+#define LED_VERDE    23
+#define LED_AMARILLO 22
+#define LED_ROJO     21
+
+// ===== PINES BOTONES =====
+#define BTN_SIMULAR  18
+#define BTN_CANCELAR 19
+
+// ===== BUZZER =====
+#define BUZZER 4
+
+// ===== MODULO GPS =====
+#define GPS_RX 16
+#define GPS_TX 17
+HardwareSerial serialGPS(2);
+TinyGPSPlus gps;
+
+// ===== VARIABLES DE ESTADO =====
+volatile bool emergenciaActiva = false;
+volatile bool cancelado = false;
+int contador = 9;
+unsigned long ultimoTick = 0;
+double ultimaLatitud = 0.0;
+double ultimaLongitud = 0.0;
+
+// ===== SEGMENTOS POR NUMERO (ANODO COMUN) =====
+const bool numeros[10][7] = {
+  {0,0,0,0,0,0,1}, // 0
+  {1,0,0,1,1,1,1}, // 1
+  {0,0,1,0,0,1,0}, // 2
+  {0,0,0,0,1,1,0}, // 3
+  {1,0,0,1,1,0,0}, // 4
+  {0,1,0,0,1,0,0}, // 5
+  {0,1,0,0,0,0,0}, // 6
+  {0,0,0,1,1,1,1}, // 7
+  {0,0,0,0,0,0,0}, // 8
+  {0,0,0,0,1,0,0}  // 9
+};
+
+// ===== INTERRUPCIONES =====
+void IRAM_ATTR ISR_simular() {
+  if (!emergenciaActiva) {
+    emergenciaActiva = true;
+    cancelado = false;
+    contador = 9;
+  }
+}
+
+void IRAM_ATTR ISR_cancelar() {
+  if (emergenciaActiva) {
+    cancelado = true;
+    emergenciaActiva = false;
+  }
+}
+
+// ===== FUNCIONES DISPLAY =====
+void mostrarNumero(int num) {
+  if (num < 0 || num > 9) return;
+  digitalWrite(SEG_A, numeros[num][0]);
+  digitalWrite(SEG_B, numeros[num][1]);
+  digitalWrite(SEG_C, numeros[num][2]);
+  digitalWrite(SEG_D, numeros[num][3]);
+  digitalWrite(SEG_E, numeros[num][4]);
+  digitalWrite(SEG_F, numeros[num][5]);
+  digitalWrite(SEG_G, numeros[num][6]);
+}
+
+void apagarDisplay() {
+  digitalWrite(SEG_A, HIGH);
+  digitalWrite(SEG_B, HIGH);
+  digitalWrite(SEG_C, HIGH);
+  digitalWrite(SEG_D, HIGH);
+  digitalWrite(SEG_E, HIGH);
+  digitalWrite(SEG_F, HIGH);
+  digitalWrite(SEG_G, HIGH);
+}
+
+// ===== SONIDOS =====
+void sonidoCancelacion() {
+  tone(BUZZER, 1500, 150);
+  delay(200);
+  tone(BUZZER, 1000, 150);
+  delay(200);
+  tone(BUZZER, 500, 150);
+  delay(200);
+  noTone(BUZZER);
+}
+
+void sonidoEmergency() {
+  tone(BUZZER, 500, 200);
+  delay(250);
+  tone(BUZZER, 1000, 200);
+  delay(250);
+  tone(BUZZER, 2000, 500);
+  delay(600);
+  noTone(BUZZER);
+}
+
+// ===== LEER DATOS DEL GPS =====
+void leerGPS() {
+  while (serialGPS.available() > 0) {
+    if (gps.encode(serialGPS.read())) {
+      if (gps.location.isValid()) {
+        ultimaLatitud = gps.location.lat();
+        ultimaLongitud = gps.location.lng();
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Pines display
+  pinMode(SEG_A, OUTPUT);
+  pinMode(SEG_B, OUTPUT);
+  pinMode(SEG_C, OUTPUT);
+  pinMode(SEG_D, OUTPUT);
+  pinMode(SEG_E, OUTPUT);
+  pinMode(SEG_F, OUTPUT);
+  pinMode(SEG_G, OUTPUT);
+
+  // Pines LEDs
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+
+  // Buzzer
+  pinMode(BUZZER, OUTPUT);
+
+  // Botones con interrupción
+  pinMode(BTN_SIMULAR, INPUT_PULLUP);
+  pinMode(BTN_CANCELAR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_SIMULAR), ISR_simular, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_CANCELAR), ISR_cancelar, FALLING);
+
+  // Estado inicial
+  digitalWrite(LED_VERDE, HIGH);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  apagarDisplay();
+
+  // Iniciar GPS
+  serialGPS.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+  Serial.println("Puerto serial del GPS configurado.");
+
+  // Iniciar conexión WiFi y Access Point
+  intentoconexion("espgroup1", "12341243");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    enviarAlertaTelegram("✅ Sistema de rastreo iniciado correctamente. Esperando señal satelital...");
+    enviarDatosServidor("inicio", 0.0, 0.0, 0, 0);
+  }
+
+  Serial.println("Sistema listo");
+}
+
+void loop() {
+  loopAP();
+  leerGPS();
+
+  // Validar comunicación GPS cada 5 segundos
+  static unsigned long ultimoReporteGPS = 0;
+  if (millis() - ultimoReporteGPS >= 5000) {
+    ultimoReporteGPS = millis();
+    Serial.println("--- Estado GPS ---");
+    Serial.print("Chars procesados: ");
+    Serial.println(gps.charsProcessed());
+    Serial.print("Satelites: ");
+    Serial.println(gps.satellites.value());
+    if (ultimaLatitud != 0.0 && ultimaLongitud != 0.0) {
+      Serial.print("Lat: ");
+      Serial.println(ultimaLatitud, 6);
+      Serial.print("Lng: ");
+      Serial.println(ultimaLongitud, 6);
+    } else {
+      Serial.println("Sin señal satelital aun...");
+    }
+    Serial.println("-----------------");
+  }
+
+  if (emergenciaActiva) {
+    digitalWrite(LED_VERDE, LOW);
+    digitalWrite(LED_AMARILLO, HIGH);
+    digitalWrite(LED_ROJO, HIGH);
+
+    if (millis() - ultimoTick >= 1000) {
+      ultimoTick = millis();
+      mostrarNumero(contador);
+      tone(BUZZER, 1000, 200);
+
+      Serial.print("Cuenta regresiva: ");
+      Serial.println(contador);
+
+      if (contador == 0) {
+        emergenciaActiva = false;
+        apagarDisplay();
+        digitalWrite(LED_ROJO, HIGH);
+        digitalWrite(LED_AMARILLO, LOW);
+
+        sonidoEmergency();
+
+        if (WiFi.status() == WL_CONNECTED) {
+          String mensajeTelegram = "🚨 EMERGENCIA CONFIRMADA: Conductor en peligro. Sin respuesta en 9 segundos.\n";
+
+          if (ultimaLatitud != 0.0 && ultimaLongitud != 0.0) {
+            mensajeTelegram += "📍 Ubicación: https://maps.google.com/?q=" + String(ultimaLatitud, 6) + "," + String(ultimaLongitud, 6);
+          } else {
+            mensajeTelegram += "⚠️ GPS sin señal satelital aun.";
+          }
+
+          enviarAlertaTelegram(mensajeTelegram);
+          enviarDatosServidor("emergencia", ultimaLatitud, ultimaLongitud, 0, 0);
+
+        } else {
+          Serial.println("Sin WiFi, alerta no enviada.");
+        }
+
+        Serial.println("Ciclo de alerta terminado.");
+
+      } else {
+        contador--;
+      }
+    }
+
+  } else if (cancelado) {
+    apagarDisplay();
+    digitalWrite(LED_VERDE, HIGH);
+    digitalWrite(LED_AMARILLO, LOW);
+    digitalWrite(LED_ROJO, LOW);
+
+    sonidoCancelacion();
+
+    Serial.println("Emergencia abortada por el operador.");
+    cancelado = false;
+
+  } else {
+    digitalWrite(LED_VERDE, HIGH);
+    digitalWrite(LED_AMARILLO, LOW);
+    digitalWrite(LED_ROJO, LOW);
+    apagarDisplay();
+  }
+}
