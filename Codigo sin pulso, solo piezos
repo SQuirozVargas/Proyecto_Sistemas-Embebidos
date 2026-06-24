@@ -1,0 +1,535 @@
+#include <Arduino.h>
+#include "apwifieeprommode.h"
+#include "telegram.h"
+#include "database.h"
+#include <EEPROM.h>
+
+// ================== PINES DISPLAY ==================
+#define SEG_A 13
+#define SEG_B 32
+#define SEG_C 14
+#define SEG_D 27
+#define SEG_E 26
+#define SEG_F 25
+#define SEG_G 33
+
+// ================== LEDS ==================
+#define LED_VERDE    23
+#define LED_AMARILLO 22
+#define LED_ROJO     21
+
+// ================== BUZZER ==================
+#define BUZZER     4
+#define LEDC_CANAL 0
+
+// ================== BOTON CANCELAR ==================
+#define BTN_CANCELAR 19
+
+// ================== PIEZOS Y PULSO ==================
+#define PIN_PIEZO_IZQ     34
+#define PIN_PIEZO_DER     35
+#define PIN_PULSO         36
+#define UMBRAL_SENTADO    1000
+#define UMBRAL_DESBALANCE 500
+// Umbrales de pulso eliminados: ahora se usa umbral dinamico adaptativo
+
+// ================== TIEMPOS ==================
+#define TIEMPO_INCLINACION_AVISO_MS  10000
+#define TIEMPO_INCLINACION_ALERTA_MS 15000
+#define TIEMPO_SIN_PULSO_MS          10000
+#define TIEMPO_BUZZER_MS             10000
+
+// ================== MAQUINA DE ESTADOS ==================
+enum EstadoSistema {
+  VACIO,
+  SENTADO_NORMAL,
+  INCLINADO,
+  ADVERTENCIA_PULSO,
+  EMERGENCIA
+};
+
+EstadoSistema estadoActual = VACIO;
+
+// ================== TIMER INTERRUPCIONES ==================
+hw_timer_t *timerSensores = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// analogRead() eliminado de la ISR (era ilegal en ESP32).
+// Los piezos y el pulso se leen directamente en leerSensores() con millis().
+void IRAM_ATTR onTimerSensores() {
+  // ISR reservada para uso futuro si se necesita timing preciso
+}
+
+// ================== VARIABLES SENSORES ==================
+int valorPiezoIzq = 0;
+int valorPiezoDer = 0;
+int valorDelta    = 0;
+int valorPulso    = 0;
+
+bool personaSentada    = false;
+bool inclinacionActiva = false;
+bool hayPulso          = false;
+String dirInclinacion  = "Normal";
+
+float lpm = 0.0;
+
+// ================== DETECCION DE PULSO MEJORADA ==================
+// Media movil para suavizar ruido del Pulse Sensor
+#define PULSO_MUESTRAS 8
+int bufferPulso[PULSO_MUESTRAS] = {0};
+int indicePulso = 0;
+int pulsoSuavizado = 0;
+
+// Umbral dinamico: se adapta al minimo/maximo real de la senal
+int pulsoMin = 4095;
+int pulsoMax = 0;
+int umbralDinamico = 2048;
+unsigned long tiempoUltimaAdaptacion = 0;
+#define INTERVALO_ADAPTACION_MS 2000   // recalcula umbral cada 2s
+
+// Control de latidos
+bool enPico = false;
+unsigned long tiempoUltimoLatido = 0;
+unsigned long tiempoUltimoPulsoDetectado = 0;
+
+// Validacion por confirmacion: requiere N latidos consecutivos validos
+#define LATIDOS_MINIMOS 3
+int latidosConfirmados = 0;
+float lpmAcumulado = 0.0;
+
+// ================== TIMERS ESTADO ==================
+unsigned long tiempoInclinacion    = 0;
+unsigned long tiempoSinPulso       = 0;
+unsigned long tiempoBuzzerInicio   = 0;
+bool buzzerAdvertencia             = false;
+String tipoEmergencia              = "";
+
+// ================== BUZZER INCLINADO (NUEVO) ==================
+bool buzzerInclinacionActivo        = false;
+unsigned long tiempoBuzzerInclinacion = 0;
+
+// ================== CUENTA REGRESIVA ==================
+volatile bool emergenciaActiva = false;
+volatile bool cancelado        = false;
+int contador                   = 9;
+unsigned long ultimoTick       = 0;
+
+// ================== DISPLAY ==================
+const bool numeros[10][7] = {
+  {0,0,0,0,0,0,1}, // 0
+  {1,0,0,1,1,1,1}, // 1
+  {0,0,1,0,0,1,0}, // 2
+  {0,0,0,0,1,1,0}, // 3
+  {1,0,0,1,1,0,0}, // 4
+  {0,1,0,0,1,0,0}, // 5
+  {0,1,0,0,0,0,0}, // 6
+  {0,0,0,1,1,1,1}, // 7
+  {0,0,0,0,0,0,0}, // 8
+  {0,0,0,0,1,0,0}  // 9
+};
+
+void mostrarNumero(int num) {
+  if (num < 0 || num > 9) return;
+  digitalWrite(SEG_A, numeros[num][0]);
+  digitalWrite(SEG_B, numeros[num][1]);
+  digitalWrite(SEG_C, numeros[num][2]);
+  digitalWrite(SEG_D, numeros[num][3]);
+  digitalWrite(SEG_E, numeros[num][4]);
+  digitalWrite(SEG_F, numeros[num][5]);
+  digitalWrite(SEG_G, numeros[num][6]);
+}
+
+void apagarDisplay() {
+  digitalWrite(SEG_A, HIGH); digitalWrite(SEG_B, HIGH);
+  digitalWrite(SEG_C, HIGH); digitalWrite(SEG_D, HIGH);
+  digitalWrite(SEG_E, HIGH); digitalWrite(SEG_F, HIGH);
+  digitalWrite(SEG_G, HIGH);
+}
+
+// ================== ISR CANCELAR ==================
+void IRAM_ATTR ISR_cancelar() {
+  if (emergenciaActiva) {
+    cancelado = true;
+    emergenciaActiva = false;
+  }
+}
+
+// ================== SONIDOS ==================
+void sonidoCancelacion() {
+  ledcWriteTone(LEDC_CANAL, 1500); delay(150);
+  ledcWriteTone(LEDC_CANAL, 0);    delay(200);
+  ledcWriteTone(LEDC_CANAL, 1000); delay(150);
+  ledcWriteTone(LEDC_CANAL, 0);    delay(200);
+  ledcWriteTone(LEDC_CANAL, 500);  delay(150);
+  ledcWriteTone(LEDC_CANAL, 0);
+}
+
+void sonidoEmergency() {
+  ledcWriteTone(LEDC_CANAL, 500);  delay(200);
+  ledcWriteTone(LEDC_CANAL, 0);    delay(250);
+  ledcWriteTone(LEDC_CANAL, 1000); delay(200);
+  ledcWriteTone(LEDC_CANAL, 0);    delay(250);
+  ledcWriteTone(LEDC_CANAL, 2000); delay(500);
+  ledcWriteTone(LEDC_CANAL, 0);
+}
+
+void sonidoAdvertencia() {
+  ledcWriteTone(LEDC_CANAL, 800); delay(200);
+  ledcWriteTone(LEDC_CANAL, 0);   delay(300);
+  ledcWriteTone(LEDC_CANAL, 800); delay(200);
+  ledcWriteTone(LEDC_CANAL, 0);   delay(300);
+  ledcWriteTone(LEDC_CANAL, 800); delay(200);
+  ledcWriteTone(LEDC_CANAL, 0);
+}
+
+// ================== ALERTA ==================
+void enviarAlerta() {
+  if (WiFi.status() == WL_CONNECTED) {
+    String msg = "🚨 EMERGENCIA: " + tipoEmergencia + "\n";
+    msg += "BPM: " + String(lpm, 1) + "\n";
+    msg += "⚠️ GPS no disponible";
+    enviarAlertaTelegram(msg);
+    enviarDatosServidor(tipoEmergencia, 0.0, 0.0, (int)lpm, 0);
+  }
+}
+
+// ================== LEER SENSORES ==================
+void leerSensores() {
+  // Lectura directa — analogRead() es seguro aqui fuera de ISR
+  valorPiezoIzq = analogRead(PIN_PIEZO_IZQ);
+  valorPiezoDer = analogRead(PIN_PIEZO_DER);
+  valorPulso    = analogRead(PIN_PULSO);
+
+  valorDelta = valorPiezoDer - valorPiezoIzq;
+
+  // Presencia
+  personaSentada = (valorPiezoIzq > UMBRAL_SENTADO || valorPiezoDer > UMBRAL_SENTADO);
+
+  // Inclinacion
+  if (valorDelta > UMBRAL_DESBALANCE) {
+    inclinacionActiva = true;
+    dirInclinacion = "DERECHA";
+  } else if (valorDelta < -UMBRAL_DESBALANCE) {
+    inclinacionActiva = true;
+    dirInclinacion = "IZQUIERDA";
+  } else {
+    inclinacionActiva = false;
+    dirInclinacion = "Normal";
+  }
+
+  // ===== PULSO: media movil para suavizar ruido =====
+  bufferPulso[indicePulso] = valorPulso;
+  indicePulso = (indicePulso + 1) % PULSO_MUESTRAS;
+  long suma = 0;
+  for (int i = 0; i < PULSO_MUESTRAS; i++) suma += bufferPulso[i];
+  pulsoSuavizado = suma / PULSO_MUESTRAS;
+
+  // ===== Umbral dinamico: sigue el min/max real de la senal =====
+  if (pulsoSuavizado > pulsoMax) pulsoMax = pulsoSuavizado;
+  if (pulsoSuavizado < pulsoMin) pulsoMin = pulsoSuavizado;
+
+  unsigned long ahora = millis();
+  if (ahora - tiempoUltimaAdaptacion >= INTERVALO_ADAPTACION_MS) {
+    tiempoUltimaAdaptacion = ahora;
+    int amplitud = pulsoMax - pulsoMin;
+
+    // Sin dedo: el Pulse Sensor genera ruido de alta amplitud IRREGULAR
+    // Con dedo: amplitud moderada y PERIODICA (~200-800 cuentas tipico)
+    // Umbral minimo elevado a 300 para ignorar ruido fino de pin flotante
+    if (amplitud >= 300 && amplitud <= 2500) {
+      umbralDinamico = pulsoMin + (amplitud * 55) / 100;
+    } else {
+      // Amplitud fuera de rango fisiologico -> no hay dedo
+      umbralDinamico = 4000;
+    }
+    pulsoMax = 0;
+    pulsoMin = 4095;
+  }
+
+  // ===== Deteccion de pico con umbral dinamico =====
+  if (pulsoSuavizado > umbralDinamico && !enPico) {
+    enPico = true;
+    unsigned long intervaloMs = ahora - tiempoUltimoLatido;
+    tiempoUltimoLatido = ahora;
+
+    // Intervalo valido: 300ms–1500ms = 40–200 BPM
+    // SOLO se actualiza tiempoUltimoPulsoDetectado cuando el intervalo es fisiologico
+    if (intervaloMs > 300 && intervaloMs < 1500 && tiempoUltimoLatido > intervaloMs) {
+      float bpmCalculado = 60000.0 / intervaloMs;
+      latidosConfirmados++;
+      lpmAcumulado += bpmCalculado;
+
+      if (latidosConfirmados >= LATIDOS_MINIMOS) {
+        lpm = lpmAcumulado / latidosConfirmados;
+        lpmAcumulado = 0.0;
+        latidosConfirmados = 0;
+        hayPulso = true;
+        tiempoUltimoPulsoDetectado = ahora;  // SOLO aqui: pulso real confirmado
+      }
+    } else {
+      // Intervalo invalido: resetear confirmacion pero NO tocar tiempoUltimoPulsoDetectado
+      latidosConfirmados = 0;
+      lpmAcumulado = 0.0;
+      // NO actualizamos tiempoUltimoPulsoDetectado -> el timeout de 4s puede expirar
+    }
+  } else if (pulsoSuavizado < umbralDinamico - 80) {
+    enPico = false;
+  }
+
+  // ===== Sin latido confirmado por mas de 4s -> sin pulso =====
+  if (ahora - tiempoUltimoPulsoDetectado > 4000) {
+    hayPulso = false;
+    lpm = 0.0;
+    latidosConfirmados = 0;
+    lpmAcumulado = 0.0;
+  }
+}
+
+// ================== MAQUINA DE ESTADOS ==================
+void actualizarEstado() {
+  switch (estadoActual) {
+
+    // ===== VACIO =====
+    case VACIO:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, LOW);
+      digitalWrite(LED_ROJO, LOW);
+      apagarDisplay();
+      tiempoSinPulso = 0;
+      tiempoInclinacion = 0;
+      buzzerAdvertencia = false;
+      buzzerInclinacionActivo = false;   // NUEVO: resetear al vaciar
+      if (personaSentada)
+        estadoActual = SENTADO_NORMAL;
+      break;
+
+    // ===== SENTADO NORMAL =====
+    case SENTADO_NORMAL:
+      digitalWrite(LED_VERDE, HIGH);
+      digitalWrite(LED_AMARILLO, LOW);
+      digitalWrite(LED_ROJO, LOW);
+      apagarDisplay();
+      tiempoInclinacion = 0;
+      buzzerInclinacionActivo = false;   // NUEVO: resetear al normalizar
+
+      if (!personaSentada) {
+        estadoActual = VACIO;
+        break;
+      }
+      if (inclinacionActiva) {
+        tiempoInclinacion = millis();
+        estadoActual = INCLINADO;
+        break;
+      }
+      if (!hayPulso) {
+        if (tiempoSinPulso == 0) tiempoSinPulso = millis();
+        if (millis() - tiempoSinPulso >= TIEMPO_SIN_PULSO_MS) {
+          estadoActual = ADVERTENCIA_PULSO;
+        }
+      } else {
+        tiempoSinPulso = 0;
+      }
+      break;
+
+    // ===== INCLINADO =====
+    case INCLINADO:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, LOW);
+
+      if (!personaSentada) {
+        buzzerInclinacionActivo = false;   // NUEVO
+        estadoActual = VACIO;
+        break;
+      }
+
+      if (!inclinacionActiva) {
+        tiempoInclinacion = 0;
+        buzzerInclinacionActivo = false;   // NUEVO
+        estadoActual = SENTADO_NORMAL;
+        break;
+      }
+
+      // Aviso informativo a los 10s
+      if (millis() - tiempoInclinacion >= TIEMPO_INCLINACION_AVISO_MS) {
+        static unsigned long ultimoAviso = 0;
+        if (millis() - ultimoAviso >= 5000) {
+          ultimoAviso = millis();
+          Serial.println("⚠️ AVISO: Inclinado hacia " + dirInclinacion +
+                         " por " + String((millis() - tiempoInclinacion) / 1000) + "s");
+        }
+      }
+
+      // ---- NUEVO: advertencia sonora antes de escalar a emergencia ----
+      if (!hayPulso && millis() - tiempoInclinacion >= TIEMPO_INCLINACION_ALERTA_MS) {
+
+        // Primera vez: activar buzzer y arrancar temporizador de gracia
+        if (!buzzerInclinacionActivo) {
+          buzzerInclinacionActivo = true;
+          tiempoBuzzerInclinacion = millis();
+          sonidoAdvertencia();
+          Serial.println("ADVERTENCIA: inclinado sin pulso -> posible desmayo hacia " + dirInclinacion);
+        }
+
+        // Después de TIEMPO_BUZZER_MS sin cancelar, escalar a emergencia
+        if (millis() - tiempoBuzzerInclinacion >= TIEMPO_BUZZER_MS) {
+          buzzerInclinacionActivo = false;
+          tipoEmergencia = "DESMAYO_" + dirInclinacion;
+          emergenciaActiva = true;
+          cancelado = false;
+          contador = 9;
+          estadoActual = EMERGENCIA;
+        }
+      }
+      // ---- FIN NUEVO ----
+      break;
+
+    // ===== ADVERTENCIA PULSO =====
+    case ADVERTENCIA_PULSO:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, LOW);
+
+      if (!personaSentada) { estadoActual = VACIO; break; }
+
+      if (hayPulso) {
+        tiempoSinPulso = 0;
+        buzzerAdvertencia = false;
+        ledcWriteTone(LEDC_CANAL, 0);
+        estadoActual = SENTADO_NORMAL;
+        break;
+      }
+
+      if (!buzzerAdvertencia) {
+        buzzerAdvertencia = true;
+        tiempoBuzzerInicio = millis();
+        sonidoAdvertencia();
+        Serial.println("ADVERTENCIA: Sin pulso, tome el volante");
+      }
+
+      if (millis() - tiempoBuzzerInicio >= TIEMPO_BUZZER_MS) {
+        tipoEmergencia = "INFARTO_POSIBLE";
+        emergenciaActiva = true;
+        cancelado = false;
+        contador = 9;
+        estadoActual = EMERGENCIA;
+      }
+      break;
+
+    // ===== EMERGENCIA =====
+    case EMERGENCIA:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, HIGH);
+
+      if (cancelado) {
+        apagarDisplay();
+        digitalWrite(LED_VERDE, HIGH);
+        digitalWrite(LED_AMARILLO, LOW);
+        digitalWrite(LED_ROJO, LOW);
+        sonidoCancelacion();
+        Serial.println("Emergencia cancelada.");
+        cancelado = false;
+        tiempoSinPulso = 0;
+        buzzerAdvertencia = false;
+        buzzerInclinacionActivo = false;   // NUEVO
+        estadoActual = SENTADO_NORMAL;
+        break;
+      }
+
+      if (millis() - ultimoTick >= 1000) {
+        ultimoTick = millis();
+        mostrarNumero(contador);
+        ledcWriteTone(LEDC_CANAL, 1000);
+        delay(200);
+        ledcWriteTone(LEDC_CANAL, 0);
+        Serial.print("Cuenta regresiva: ");
+        Serial.println(contador);
+
+        if (contador == 0) {
+          emergenciaActiva = false;
+          apagarDisplay();
+          digitalWrite(LED_ROJO, HIGH);
+          digitalWrite(LED_AMARILLO, LOW);
+          sonidoEmergency();
+          enviarAlerta();
+          Serial.println("Alerta enviada.");
+          estadoActual = VACIO;
+        } else {
+          contador--;
+        }
+      }
+      break;
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SEG_A, OUTPUT); pinMode(SEG_B, OUTPUT);
+  pinMode(SEG_C, OUTPUT); pinMode(SEG_D, OUTPUT);
+  pinMode(SEG_E, OUTPUT); pinMode(SEG_F, OUTPUT);
+  pinMode(SEG_G, OUTPUT);
+
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+
+  ledcSetup(LEDC_CANAL, 1000, 8);
+  ledcAttachPin(BUZZER, LEDC_CANAL);
+
+  pinMode(BTN_CANCELAR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_CANCELAR), ISR_cancelar, FALLING);
+
+  pinMode(PIN_PIEZO_IZQ, INPUT);
+  pinMode(PIN_PIEZO_DER, INPUT);
+  pinMode(PIN_PULSO, INPUT);
+
+  // Timer para sensores cada 10ms
+  timerSensores = timerBegin(1, 80, true);
+  timerAttachInterrupt(timerSensores, &onTimerSensores, true);
+  timerAlarmWrite(timerSensores, 10000, true);
+  timerAlarmEnable(timerSensores);
+
+  digitalWrite(LED_VERDE, HIGH);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  apagarDisplay();
+
+  intentoconexion("espgroup1", "12341243");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    enviarAlertaTelegram("✅ Sistema iniciado correctamente.");
+    enviarDatosServidor("inicio", 0.0, 0.0, 0, 0);
+  }
+
+  Serial.println("Sistema listo");
+}
+
+// ================== LOOP ==================
+void loop() {
+  loopAP();
+  leerSensores();
+  actualizarEstado();
+
+  static unsigned long ultimoReporte = 0;
+  if (millis() - ultimoReporte >= 100) {
+    ultimoReporte = millis();
+    Serial.print("IZQ: ");        Serial.print(valorPiezoIzq);
+    Serial.print(" | DER: ");     Serial.print(valorPiezoDer);
+    Serial.print(" | DELTA: ");   Serial.print(valorDelta);
+    Serial.print(" | Estado: ");  Serial.print(
+      estadoActual == VACIO             ? "VACIO" :
+      estadoActual == SENTADO_NORMAL    ? "NORMAL" :
+      estadoActual == INCLINADO         ? "INCLINADO_" + dirInclinacion :
+      estadoActual == ADVERTENCIA_PULSO ? "SIN_PULSO" :
+                                          "EMERGENCIA"
+    );
+    Serial.print(" | Pulso: ");   Serial.print(hayPulso ? "Si" : "No");
+    Serial.print(" | LPM: ");     Serial.print(lpm);
+    Serial.print(" | RAW: ");     Serial.print(valorPulso);
+    Serial.print(" | SUAV: ");    Serial.print(pulsoSuavizado);
+    Serial.print(" | UMBRAL: ");  Serial.println(umbralDinamico);
+  }
+}
