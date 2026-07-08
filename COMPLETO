@@ -1,0 +1,678 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include "apwifieeprommode.h"
+#include "telegram.h"
+#include "database.h"
+#include <EEPROM.h>
+#include <TinyGPS++.h>
+
+// ================== PINES DISPLAY ==================
+#define SEG_A 13
+#define SEG_B 32
+#define SEG_C 14
+#define SEG_D 27
+#define SEG_E 26
+#define SEG_F 25
+#define SEG_G 33
+
+// ================== LEDS ==================
+#define LED_VERDE    23
+#define LED_AMARILLO 22
+#define LED_ROJO     21
+
+// ================== BUZZER ==================
+#define BUZZER     4
+#define LEDC_CANAL 0
+
+// ================== BOTON CANCELAR ==================
+#define BTN_CANCELAR 19
+
+// ================== PIEZOS (COJÍN POSTURAL) ==================
+#define PIN_PIEZO_IZQ     15   // Mudado para evitar conflictos
+#define PIN_PIEZO_DER     35   
+#define UMBRAL_SENTADO    1000
+#define UMBRAL_DESBALANCE  500
+
+// ================== SENSOR MANOS EN VOLANTE (IR DIGITAL) ==================
+#define PIN_MANOS_VOLANTE 2    // Mapeado al GPIO 2 seguro
+
+// ================== SENSOR DE PULSO (ANALÓGICO) ==================
+#define PIN_PULSO         34   // Mapeado al GPIO 34 seguro
+
+// --- CONSTANTES DEL ALGORITMO DE PULSO V5 ---
+#define TAMANO_FILTRO_SENAL    15       // Promedio móvil para la señal analógica cruda
+#define HISTERESIS             40       // Margen para detección de picos
+#define TAMANO_FILTRO_LPM      4        // Ventana para promediar los LPM de salida
+#define MAX_VARIACION_PORCENTUAL 0.15f  // Máxima variación permitida entre latidos (15%)
+
+// ================== TIEMPOS ==================
+#define TIEMPO_SIN_MANOS_MS             8000
+#define TIEMPO_BUZZER_MS                8000
+#define TIEMPO_INCLINACION_ALERTA_MS    8000
+#define TIEMPO_INCLINACION_CON_MANOS_MS 30000
+
+// ================== GPS ==================
+#define GPS_RX_PIN   16
+#define GPS_TX_PIN   17
+#define GPS_BAUDRATE 9600
+
+HardwareSerial gpsSerial(2);
+TinyGPSPlus    gps;
+double gpsLat = 0.0, gpsLng = 0.0;
+bool   gpsValido = false;
+
+void gpsTick() {
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  if (gps.location.isValid() && gps.location.age() < 2000) {
+    gpsLat = gps.location.lat();
+    gpsLng = gps.location.lng();
+    gpsValido = true;
+  } else {
+    gpsValido = false;
+  }
+}
+
+// ================== SIM900 ==================
+#define SIM_RX_PIN            18
+#define SIM_TX_PIN             5
+#define SIM_BAUDRATE        9600
+#define SIM_NUMERO_EMERGENCIA "+593963834144"
+#define SIM_MAX_REINTENTOS     3
+#define SIM_TIMEOUT_MS     15000
+
+HardwareSerial simSerial(1);
+
+enum EstadoSIM {
+  SIM_IDLE, SIM_VERIFICANDO, SIM_ENVIANDO_SMS,
+  SIM_ESPERANDO_OK, SIM_LISTO, SIM_ERROR
+};
+
+EstadoSIM     estadoSIM     = SIM_IDLE;
+unsigned long tiempoSIM     = 0;
+String        mensajeSIM    = "";
+int           reintentosSIM = 0;
+
+void simEnviarComando(const String& cmd) {
+  simSerial.println(cmd);
+  tiempoSIM = millis();
+  Serial.println("[SIM] >> " + cmd);
+}
+
+String simLeerRespuesta() {
+  String resp = "";
+  unsigned long t = millis();
+  while (millis() - t < 300)
+    while (simSerial.available()) resp += (char)simSerial.read();
+  if (resp.length() > 0) Serial.println("[SIM] << " + resp);
+  return resp;
+}
+
+void simIniciarEnvio(const String& mensaje) {
+  if (estadoSIM == SIM_ENVIANDO_SMS || estadoSIM == SIM_VERIFICANDO ||
+      estadoSIM == SIM_ESPERANDO_OK) {
+    Serial.println("[SIM] Envio ya en curso.");
+    return;
+  }
+  mensajeSIM = mensaje; reintentosSIM = 0;
+  estadoSIM  = SIM_VERIFICANDO;
+  simEnviarComando("AT");
+  Serial.println("[SIM] Iniciando envio por GSM.");
+}
+
+void simTick() {
+  if (estadoSIM == SIM_IDLE || estadoSIM == SIM_LISTO || estadoSIM == SIM_ERROR) return;
+  static unsigned long ultimoLogSIM = 0;
+  if (millis() - ultimoLogSIM >= 2000) {
+    ultimoLogSIM = millis();
+    Serial.println("[SIM] Esperando... " + String(
+      estadoSIM == SIM_VERIFICANDO  ? "VERIFICANDO"  :
+      estadoSIM == SIM_ENVIANDO_SMS ? "ENVIANDO_SMS" :
+      estadoSIM == SIM_ESPERANDO_OK ? "ESPERANDO_OK" : "?"
+    ));
+  }
+  if (millis() - tiempoSIM > SIM_TIMEOUT_MS) {
+    reintentosSIM++;
+    if (reintentosSIM >= SIM_MAX_REINTENTOS) {
+      estadoSIM = SIM_ERROR;
+      Serial.println("[SIM] Fallo definitivo.");
+      return;
+    }
+    estadoSIM = SIM_VERIFICANDO;
+    simEnviarComando("AT");
+    return;
+  }
+  if (!simSerial.available()) return;
+  String resp = simLeerRespuesta();
+  switch (estadoSIM) {
+    case SIM_VERIFICANDO:
+      if (resp.indexOf("OK") >= 0) { simEnviarComando("AT+CMGF=1"); estadoSIM = SIM_ENVIANDO_SMS; }
+      break;
+    case SIM_ENVIANDO_SMS:
+      if (resp.indexOf("OK") >= 0) { simEnviarComando("AT+CMGS=\"" + String(SIM_NUMERO_EMERGENCIA) + "\""); estadoSIM = SIM_ESPERANDO_OK; }
+      break;
+    case SIM_ESPERANDO_OK:
+      if (resp.indexOf(">")           >= 0) { simSerial.print(mensajeSIM); simSerial.write(0x1A); tiempoSIM = millis(); }
+      if (resp.indexOf("SEND OK") >= 0) { estadoSIM = SIM_LISTO; reintentosSIM = 0; Serial.println("[SIM] SMS enviado."); }
+      if (resp.indexOf("ERROR")   >= 0) {
+        reintentosSIM++;
+        if (reintentosSIM >= SIM_MAX_REINTENTOS) estadoSIM = SIM_ERROR;
+        else { estadoSIM = SIM_VERIFICANDO; simEnviarComando("AT"); }
+      }
+      break;
+    default: break;
+  }
+}
+
+// ================== MAQUINA DE ESTADOS ==================
+enum EstadoSistema { VACIO, SENTADO_NORMAL, INCLINADO, ADVERTENCIA_MANOS, EMERGENCIA };
+EstadoSistema estadoActual = VACIO;
+
+// ================== TIMER ==================
+hw_timer_t  *timerSensores = NULL;
+portMUX_TYPE timerMux      = portMUX_INITIALIZER_UNLOCKED;
+void IRAM_ATTR onTimerSensores() {}
+
+// ================== VARIABLES SENSORES COJÍN ==================
+int    valorPiezoIzq    = 0;
+int    valorPiezoDer    = 0;
+int    valorDelta       = 0;
+bool   personaSentada   = false;
+bool   inclinacionActiva = false;
+String dirInclinacion   = "Normal";
+
+// ================== VARIABLES CONTROL VOLANTE (PULSO ROBUSTO) ==================
+bool   manosEnVolante   = false;
+int    historial_lecturas[TAMANO_FILTRO_SENAL] = {0};
+int    indice_filtro_senal = 0;
+int    suma_filtro_senal = 0;
+
+float  historial_lpm[TAMANO_FILTRO_LPM] = {0};
+int    indice_filtro_lpm = 0;
+float  suma_filtro_lpm = 0;
+int    conteo_lpm_validos = 0;
+
+unsigned long tiempo_ultimo_pico = 0; // Guardado en milisegundos para Arduino
+bool   pico_detectado = false;
+float  lpm_instantaneo = 0.0;
+float  lpm_ultimo_valido = 0.0; 
+float  valorPulso = 0.0;             // Aquí se guardará el pulso promediado final
+
+// ================== TIMERS ESTADO ==================
+unsigned long tiempoSinManos            = 0;
+unsigned long tiempoInclinacion         = 0;
+unsigned long tiempoBuzzerInicio        = 0;
+unsigned long tiempoBuzzerInclinacion   = 0;
+unsigned long tiempoInclinacionConManos = 0;
+bool   buzzerAdvertencia         = false;
+bool   buzzerInclinacionActivo   = false;
+bool   avisoPosturaDado          = false;
+String tipoEmergencia            = "";
+
+// ================== BANDERA INCLINACION ==================
+bool   inclinacionIniciada    = false;
+unsigned long tiempoSinInclinacion  = 0;    
+#define TIEMPO_FIN_INCLINACION_MS   500     
+unsigned long tiempoSinPresencia    = 0;    
+#define TIEMPO_FIN_PRESENCIA_MS     500     
+
+// ================== CUENTA REGRESIVA ==================
+volatile bool emergenciaActiva = false;
+volatile bool cancelado        = false;
+int           contador         = 9;
+unsigned long ultimoTick          = 0;
+
+// ================== DISPLAY ==================
+const bool numeros[10][7] = {
+  {0,0,0,0,0,0,1},{1,0,0,1,1,1,1},{0,0,1,0,0,1,0},{0,0,0,0,1,1,0},{1,0,0,1,1,0,0},
+  {0,1,0,0,1,0,0},{0,1,0,0,0,0,0},{0,0,0,1,1,1,1},{0,0,0,0,0,0,0},{0,0,0,0,1,0,0}
+};
+
+void mostrarNumero(int n) {
+  if (n < 0 || n > 9) return;
+  digitalWrite(SEG_A, numeros[n][0]); digitalWrite(SEG_B, numeros[n][1]);
+  digitalWrite(SEG_C, numeros[n][2]); digitalWrite(SEG_D, numeros[n][3]);
+  digitalWrite(SEG_E, numeros[n][4]); digitalWrite(SEG_F, numeros[n][5]);
+  digitalWrite(SEG_G, numeros[n][6]);
+}
+
+void apagarDisplay() {
+  digitalWrite(SEG_A,HIGH); digitalWrite(SEG_B,HIGH); digitalWrite(SEG_C,HIGH);
+  digitalWrite(SEG_D,HIGH); digitalWrite(SEG_E,HIGH); digitalWrite(SEG_F,HIGH);
+  digitalWrite(SEG_G,HIGH);
+}
+
+// ================== ISR CANCELAR ==================
+void IRAM_ATTR ISR_cancelar() {
+  if (emergenciaActiva) { cancelado = true; emergenciaActiva = false; }
+}
+
+// ================== SONIDOS ==================
+void sonidoCancelacion() {
+  ledcWriteTone(LEDC_CANAL,1500); delay(150); ledcWriteTone(LEDC_CANAL,0); delay(200);
+  ledcWriteTone(LEDC_CANAL,1000); delay(150); ledcWriteTone(LEDC_CANAL,0); delay(200);
+  ledcWriteTone(LEDC_CANAL, 500); delay(150); ledcWriteTone(LEDC_CANAL,0);
+}
+void sonidoEmergency() {
+  ledcWriteTone(LEDC_CANAL, 500); delay(200); ledcWriteTone(LEDC_CANAL,0); delay(250);
+  ledcWriteTone(LEDC_CANAL,1000); delay(200); ledcWriteTone(LEDC_CANAL,0); delay(250);
+  ledcWriteTone(LEDC_CANAL,2000); delay(500); ledcWriteTone(LEDC_CANAL,0);
+}
+void sonidoAdvertencia() {
+  ledcWriteTone(LEDC_CANAL,800); delay(200); ledcWriteTone(LEDC_CANAL,0); delay(300);
+  ledcWriteTone(LEDC_CANAL,800); delay(200); ledcWriteTone(LEDC_CANAL,0); delay(300);
+  ledcWriteTone(LEDC_CANAL,800); delay(200); ledcWriteTone(LEDC_CANAL,0);
+}
+void sonidoPostura() {
+  ledcWriteTone(LEDC_CANAL,400); delay(100); ledcWriteTone(LEDC_CANAL,0); delay(100);
+  ledcWriteTone(LEDC_CANAL,400); delay(100); ledcWriteTone(LEDC_CANAL,0);
+}
+
+// ================== VERIFICACION DE INTERNET REAL ==================
+bool hayInternetReal() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiClient c; c.setTimeout(2000);
+  bool ok = c.connect("api.telegram.org", 443);
+  c.stop(); return ok;
+}
+
+// ================== ALERTA ==================
+void enviarAlerta() {
+  String ubicacion = gpsValido
+    ? "https://maps.google.com/?q=" + String(gpsLat,6) + "," + String(gpsLng,6)
+    : "GPS sin fix";
+  String msg = "EMERGENCIA: " + tipoEmergencia + " | GPS: " + ubicacion + " | Pulso Final: " + String(valorPulso,1) + " LPM";
+  Serial.println("[ALERTA] Verificando conectividad...");
+  if (hayInternetReal()) {
+    Serial.println("[ALERTA] Enviando por WiFi/Telegram...");
+    enviarAlertaTelegram(msg);
+    enviarDatosServidor(tipoEmergencia, gpsLat, gpsLng, (int)valorPulso, 0);
+    estadoSIM = SIM_IDLE;
+  } else {
+    Serial.println("[ALERTA] Sin internet. Activando SIM900...");
+    estadoSIM = SIM_IDLE;
+    simIniciarEnvio(msg);
+  }
+}
+
+// ================== LEER SENSORES CON FILTRADO ROBUSTO ==================
+void leerSensores() {
+  // 1. Lecturas del Cojín Postural
+  valorPiezoIzq = analogRead(PIN_PIEZO_IZQ);  // GPIO 15
+  valorPiezoDer = analogRead(PIN_PIEZO_DER);  // GPIO 35
+  valorDelta    = valorPiezoDer - valorPiezoIzq;
+
+  personaSentada = (valorPiezoIzq > UMBRAL_SENTADO || valorPiezoDer > UMBRAL_SENTADO);
+
+  if      (valorDelta >  UMBRAL_DESBALANCE) { inclinacionActiva = true;  dirInclinacion = "DERECHA";   }
+  else if (valorDelta < -UMBRAL_DESBALANCE) { inclinacionActiva = true;  dirInclinacion = "IZQUIERDA"; }
+  else                                      { inclinacionActiva = false; dirInclinacion = "Normal";    }
+
+  // 2. Control Infrarrojo de Manos en Volante (Módulo IR Digital)
+  // El módulo da LOW (0) al detectar el contacto físico del dedo
+  manosEnVolante = (digitalRead(PIN_MANOS_VOLANTE) == LOW);
+
+  // 3. Algoritmo de Pulso Protegido (Si hay manos en el volante)
+  if (!manosEnVolante) {
+    // Si suelta el volante, reseteamos las variables del algoritmo de pulso
+    pico_detectado = false;
+    lpm_instantaneo = 0.0;
+    lpm_ultimo_valido = 0.0;
+    valorPulso = 0.0; 
+    tiempo_ultimo_pico = 0;
+    indice_filtro_lpm = 0;
+    suma_filtro_lpm = 0;
+    conteo_lpm_validos = 0;
+    for (int i = 0; i < TAMANO_FILTRO_LPM; i++) historial_lpm[i] = 0;
+    return; 
+  }
+
+  // --- PROCESAMIENTO DINÁMICO DEL PULSO (Si está tocando el volante) ---
+  int lectura_actual = analogRead(PIN_PULSO); // GPIO 34
+
+  // Filtro de promedio móvil de entrada (Señal analógica)
+  suma_filtro_senal -= historial_lecturas[indice_filtro_senal];
+  historial_lecturas[indice_filtro_senal] = lectura_actual;
+  suma_filtro_senal += lectura_actual;
+  indice_filtro_senal = (indice_filtro_senal + 1) % TAMANO_FILTRO_SENAL;
+  int linea_base = suma_filtro_senal / TAMANO_FILTRO_SENAL;
+
+  int umbral_pico = linea_base + HISTERESIS;
+
+  // Detección de picos (Latidos)
+  if (lectura_actual > umbral_pico && !pico_detectado) {
+    unsigned long tiempo_actual = millis(); 
+    
+    if (tiempo_ultimo_pico > 0) {
+      unsigned long intervalo_ms = tiempo_actual - tiempo_ultimo_pico;
+      float intervalo_segundos = (float)intervalo_ms / 1000.0;
+
+      // Filtro clínico biológico (40 a 200 LPM)
+      if (intervalo_segundos >= 0.3 && intervalo_segundos <= 1.5) {
+        lpm_instantaneo = 60.0 / intervalo_segundos;
+
+        // FILTRO DE VARIACIÓN PORCENTUAL (Opción 3 - Anti-movimiento)
+        if (lpm_ultimo_valido > 0.0) {
+          float variacion = fabs(lpm_instantaneo - lpm_ultimo_valido) / lpm_ultimo_valido;
+          
+          if (variacion > MAX_VARIACION_PORCENTUAL) {
+            // Ignora el pico por artefacto de movimiento y salta
+            tiempo_ultimo_pico = tiempo_actual;
+            pico_detectado = true;
+            return;
+          }
+        }
+        
+        lpm_ultimo_valido = lpm_instantaneo;
+
+        // PROMEDIO MÓVIL DE SALIDA (Opción 2 - Suavizado LPM)
+        suma_filtro_lpm -= historial_lpm[indice_filtro_lpm];
+        historial_lpm[indice_filtro_lpm] = lpm_instantaneo;
+        suma_filtro_lpm += lpm_instantaneo;
+        indice_filtro_lpm = (indice_filtro_lpm + 1) % TAMANO_FILTRO_LPM;
+        
+        if (conteo_lpm_validos < TAMANO_FILTRO_LPM) {
+          conteo_lpm_validos++;
+        }
+        
+        // Guardamos el pulso final ultra protegido en nuestra variable central
+        valorPulso = suma_filtro_lpm / conteo_lpm_validos;
+      }
+    }
+    tiempo_ultimo_pico = tiempo_actual;
+    pico_detectado = true;
+  } 
+  else if (lectura_actual < linea_base) {
+    pico_detectado = false;
+  }
+}
+
+// ================== MAQUINA DE ESTADOS ==================
+void actualizarEstado() {
+  switch (estadoActual) {
+
+    // ===== VACIO =====
+    case VACIO:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, LOW);
+      digitalWrite(LED_ROJO, LOW);
+      apagarDisplay();
+      tiempoSinManos          = 0;
+      tiempoSinPresencia      = 0;
+      tiempoInclinacion       = 0;
+      tiempoSinInclinacion    = 0;
+      inclinacionIniciada     = false;
+      buzzerAdvertencia       = false;
+      buzzerInclinacionActivo = false;
+      avisoPosturaDado        = false;
+      if (personaSentada) estadoActual = SENTADO_NORMAL;
+      break;
+
+    // ===== SENTADO NORMAL =====
+    case SENTADO_NORMAL:
+      digitalWrite(LED_VERDE, HIGH);
+      digitalWrite(LED_AMARILLO, LOW);
+      digitalWrite(LED_ROJO, LOW);
+      apagarDisplay();
+
+      avisoPosturaDado = false;
+
+      if (!personaSentada) {
+        if (tiempoSinPresencia == 0) tiempoSinPresencia = millis();
+        if (millis() - tiempoSinPresencia >= TIEMPO_FIN_PRESENCIA_MS) {
+          tiempoSinPresencia = 0;
+          estadoActual = VACIO;
+        }
+        break;
+      }
+      tiempoSinPresencia = 0;  
+
+      if (inclinacionActiva) {
+        tiempoSinInclinacion = 0;
+        if (!inclinacionIniciada) {
+          inclinacionIniciada = true;
+          tiempoInclinacion   = millis();
+          buzzerInclinacionActivo = false;
+        }
+        estadoActual = INCLINADO;
+        break;
+      }
+
+      if (inclinacionIniciada) {
+        if (tiempoSinInclinacion == 0) tiempoSinInclinacion = millis();
+        if (millis() - tiempoSinInclinacion >= TIEMPO_FIN_INCLINACION_MS) {
+          inclinacionIniciada     = false;
+          tiempoSinInclinacion    = 0;
+          tiempoInclinacion       = 0;
+          buzzerInclinacionActivo = false;
+        }
+      }
+
+      if (!manosEnVolante) {
+        if (tiempoSinManos == 0) tiempoSinManos = millis();
+        if (millis() - tiempoSinManos >= TIEMPO_SIN_MANOS_MS)
+          estadoActual = ADVERTENCIA_MANOS;
+      } else {
+        tiempoSinManos = 0;
+      }
+      break;
+
+    // ===== INCLINADO =====
+    case INCLINADO:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, LOW);
+
+      if (!personaSentada) {
+        if (tiempoSinPresencia == 0) tiempoSinPresencia = millis();
+        if (millis() - tiempoSinPresencia >= TIEMPO_FIN_PRESENCIA_MS) {
+          tiempoSinPresencia      = 0;
+          tiempoInclinacion       = 0;
+          inclinacionIniciada     = false;
+          tiempoSinInclinacion    = 0;
+          buzzerInclinacionActivo = false;
+          avisoPosturaDado        = false;
+          estadoActual = VACIO;
+        }
+        break;
+      }
+      tiempoSinPresencia = 0;  
+      if (!inclinacionActiva) {
+        tiempoInclinacion       = 0;
+        inclinacionIniciada     = false;
+        buzzerInclinacionActivo = false;
+        avisoPosturaDado        = false;
+        estadoActual = SENTADO_NORMAL; break;
+      }
+
+      if (!manosEnVolante &&
+          millis() - tiempoInclinacion >= TIEMPO_INCLINACION_ALERTA_MS) {
+        if (!buzzerInclinacionActivo) {
+          buzzerInclinacionActivo = true;
+          tiempoBuzzerInclinacion = millis();
+          sonidoAdvertencia();
+          Serial.println("ADVERTENCIA: Inclinado sin manos -> posible desmayo " + dirInclinacion);
+        }
+        if (millis() - tiempoBuzzerInclinacion >= TIEMPO_BUZZER_MS) {
+          buzzerInclinacionActivo = false;
+          tipoEmergencia          = "DESMAYO_" + dirInclinacion;
+          emergenciaActiva        = true;
+          cancelado               = false;
+          contador                = 9;
+          estadoActual            = EMERGENCIA;
+        }
+      }
+
+      if (manosEnVolante) {
+        buzzerInclinacionActivo = false;
+        if (tiempoInclinacionConManos == 0) tiempoInclinacionConManos = millis();
+        if (!avisoPosturaDado &&
+            millis() - tiempoInclinacionConManos >= TIEMPO_INCLINACION_CON_MANOS_MS) {
+          avisoPosturaDado          = true;
+          tiempoInclinacionConManos = millis();
+          sonidoPostura();
+          Serial.println("POSTURA: Inclinado con manos " + dirInclinacion);
+        }
+        if (avisoPosturaDado &&
+            millis() - tiempoInclinacionConManos >= TIEMPO_INCLINACION_CON_MANOS_MS)
+          avisoPosturaDado = false;
+      } else {
+        tiempoInclinacionConManos = 0;
+      }
+      break;
+
+    // ===== ADVERTENCIA MANOS =====
+    case ADVERTENCIA_MANOS:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, LOW);
+
+      if (!personaSentada) { estadoActual = VACIO; break; }
+      if (manosEnVolante) {
+        tiempoSinManos    = 0;
+        buzzerAdvertencia = false;
+        ledcWriteTone(LEDC_CANAL, 0);
+        estadoActual = SENTADO_NORMAL; break;
+      }
+      if (!buzzerAdvertencia) {
+        buzzerAdvertencia  = true;
+        tiempoBuzzerInicio = millis();
+        sonidoAdvertencia();
+        Serial.println("ADVERTENCIA: Sin manos en volante");
+      }
+      if (millis() - tiempoBuzzerInicio >= TIEMPO_BUZZER_MS) {
+        tipoEmergencia   = "MANOS_FUERA_VOLANTE";
+        emergenciaActiva = true;
+        cancelado        = false;
+        contador         = 9;
+        estadoActual     = EMERGENCIA;
+      }
+      break;
+
+    // ===== EMERGENCY =====
+    case EMERGENCIA:
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_AMARILLO, HIGH);
+      digitalWrite(LED_ROJO, HIGH);
+
+      if (cancelado) {
+        apagarDisplay();
+        digitalWrite(LED_VERDE, HIGH);
+        digitalWrite(LED_AMARILLO, LOW);
+        digitalWrite(LED_ROJO, LOW);
+        sonidoCancelacion();
+        Serial.println("Emergencia cancelada.");
+        cancelado               = false;
+        tiempoSinManos          = 0;
+        tiempoSinPresencia      = 0;
+        tiempoInclinacion       = 0;
+        tiempoSinInclinacion    = 0;
+        inclinacionIniciada     = false;
+        buzzerAdvertencia       = false;
+        buzzerInclinacionActivo = false;
+        avisoPosturaDado        = false;
+        estadoActual            = SENTADO_NORMAL;
+        break;
+      }
+
+      if (millis() - ultimoTick >= 1000) {
+        ultimoTick = millis();
+        mostrarNumero(contador);
+        ledcWriteTone(LEDC_CANAL, 1000);
+        delay(200);
+        ledcWriteTone(LEDC_CANAL, 0);
+        Serial.print("Cuenta regresiva: "); Serial.println(contador);
+        if (contador == 0) {
+          emergenciaActiva = false;
+          apagarDisplay();
+          digitalWrite(LED_ROJO, HIGH);
+          digitalWrite(LED_AMARILLO, LOW);
+          sonidoEmergency();
+          enviarAlerta();
+          Serial.println("Alerta enviada.");
+          estadoActual = VACIO;
+        } else {
+          contador--;
+        }
+      }
+      break;
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SEG_A,OUTPUT); pinMode(SEG_B,OUTPUT); pinMode(SEG_C,OUTPUT);
+  pinMode(SEG_D,OUTPUT); pinMode(SEG_E,OUTPUT); pinMode(SEG_F,OUTPUT);
+  pinMode(SEG_G,OUTPUT);
+  pinMode(LED_VERDE,OUTPUT); pinMode(LED_AMARILLO,OUTPUT); pinMode(LED_ROJO,OUTPUT);
+
+  ledcSetup(LEDC_CANAL, 1000, 8);
+  ledcAttachPin(BUZZER, LEDC_CANAL);
+
+  pinMode(BTN_CANCELAR, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BTN_CANCELAR), ISR_cancelar, FALLING);
+
+  pinMode(PIN_PIEZO_IZQ, INPUT);
+  pinMode(PIN_PIEZO_DER, INPUT);
+  pinMode(PIN_PULSO, INPUT);
+  pinMode(PIN_MANOS_VOLANTE, INPUT);
+
+  timerSensores = timerBegin(1, 80, true);
+  timerAttachInterrupt(timerSensores, &onTimerSensores, true);
+  timerAlarmWrite(timerSensores, 10000, true);
+  timerAlarmEnable(timerSensores);
+
+  gpsSerial.begin(GPS_BAUDRATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("[GPS] NEO-6M en GPIO16(RX)/GPIO17(TX)");
+
+  simSerial.begin(SIM_BAUDRATE, SERIAL_8N1, SIM_RX_PIN, SIM_TX_PIN);
+  delay(3000);
+  Serial.println("[SIM] SIM900 en GPIO18(RX)/GPIO5(TX)");
+
+  digitalWrite(LED_VERDE, HIGH);
+  digitalWrite(LED_AMARILLO, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  apagarDisplay();
+
+  intentoconexion("espgroup1", "12341243");
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[WiFi] Conectado.");
+    enviarAlertaTelegram("Sistema iniciado correctamente.");
+    enviarDatosServidor("inicio", 0.0, 0.0, 0, 0);
+  } else {
+    Serial.println("[WiFi] No disponible. Fallback: SIM900.");
+  }
+
+  Serial.println("Sistema listo");
+}
+
+// ================== LOOP ==================
+void loop() {
+  loopAP();
+  gpsTick();
+  leerSensores();
+  actualizarEstado();
+  simTick();
+
+  static unsigned long ultimoReporte = 0;
+  if (millis() - ultimoReporte >= 250) { // Reporte cada 250ms para no saturar
+    ultimoReporte = millis();
+    Serial.print("IZQ: ");       Serial.print(valorPiezoIzq);
+    Serial.print(" | DER: ");    Serial.print(valorPiezoDer);
+    Serial.print(" | PULSO: ");  
+    if (manosEnVolante && valorPulso > 0) { Serial.print(valorPulso, 1); Serial.print(" LPM"); } 
+    else { Serial.print("---"); }
+    Serial.print(" | Estado: "); Serial.print(
+      estadoActual == VACIO            ? "VACIO"    :
+      estadoActual == SENTADO_NORMAL   ? "NORMAL"   :
+      estadoActual == INCLINADO        ? "INCLINADO_" + dirInclinacion :
+      estadoActual == ADVERTENCIA_MANOS? "SIN_MANOS": "EMERGENCIA"
+    );
+    Serial.print(" | Sentado: "); Serial.print(personaSentada ? "Si" : "No");
+    Serial.print(" | Manos: ");   Serial.print(manosEnVolante ? "Si" : "No");
+    Serial.println("");
+  }
+}
