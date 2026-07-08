@@ -1,0 +1,163 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <math.h> // Necesario para fabs()
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h" 
+#include "esp_timer.h"
+#include "esp_log.h"
+
+// --- CONFIGURACIÓN DE PINES ---
+#define PIN_IR_PRESENCIA       GPIO_NUM_36   
+#define CANAL_ADC_PULSO        ADC_CHANNEL_4  
+
+// --- CONSTANTES DEL ALGORITMO ---
+#define TAMANO_FILTRO_SENAL    15       // Promedio móvil para la señal analógica cruda
+#define HISTERESIS             40       // Margen para detección de picos
+#define TAMANO_FILTRO_LPM      4        // Opción 2: Ventana para promediar los LPM de salida
+#define MAX_VARIACION_PORCENTUAL 0.15f  // Opción 3: Máxima variación permitida entre latidos (15%)
+
+static const char *TAG = "SISTEMA_VOLANTE";
+
+void app_main(void) {
+    // Variables de hardware y control (C nativo)
+    gpio_config_t io_conf;
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_12,      
+        .atten = ADC_ATTEN_DB_12,         
+    };
+
+    // Arreglos y variables para el filtro de ENTRADA (Señal Cruda)
+    int historial_lecturas[TAMANO_FILTRO_SENAL] = {0};
+    int indice_filtro_senal = 0;
+    int suma_filtro_senal = 0;
+
+    // Arreglos y variables para el filtro de SALIDA (Opción 2: Promedio LPM)
+    float historial_lpm[TAMANO_FILTRO_LPM] = {0};
+    int indice_filtro_lpm = 0;
+    float suma_filtro_lpm = 0;
+    int conteo_lpm_validos = 0;
+
+    // Variables del algoritmo de pulsaciones
+    int64_t tiempo_ultimo_pico = 0;
+    bool pico_detectado = false;
+    float lpm_instantaneo = 0.0;
+    float lpm_ultimo_valido = 0.0; // Opción 3: Para comparar la variación
+    float lpm_promediado = 0.0;
+
+    // Variables temporales de bucle
+    bool dedo_presente;
+    int lectura_actual;
+    int linea_base;
+    int umbral_pico;
+    int64_t tiempo_actual;
+    int64_t intervalo_us;
+    float intervalo_segundos;
+    float variacion;
+    int i;
+
+    // Inicializaciones de hardware
+    io_conf.pin_bit_mask = (1ULL << PIN_IR_PRESENCIA);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;   
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type = GPIO_INTR_DISABLE;      
+    gpio_config(&io_conf);
+
+    adc_oneshot_new_unit(&init_config1, &adc1_handle);
+    adc_oneshot_config_channel(adc1_handle, CANAL_ADC_PULSO, &config);
+
+    printf("=== SISTEMA INICIALIZADO - PROTECCIÓN ANTI-RUEDO ACTIVA ===\n");
+
+    while (1) {
+        // 1. CONTROL DE PRESENCIA (Gatekeeper)
+        dedo_presente = (gpio_get_level(PIN_IR_PRESENCIA) == 0);
+
+        if (!dedo_presente) {
+            // Si se quita el dedo, se resetea todo para evitar almacenar basura
+            pico_detectado = false;
+            lpm_instantaneo = 0.0;
+            lpm_ultimo_valido = 0.0;
+            lpm_promediado = 0.0;
+            tiempo_ultimo_pico = 0;
+            indice_filtro_lpm = 0;
+            suma_filtro_lpm = 0;
+            conteo_lpm_validos = 0;
+            for (i = 0; i < TAMANO_FILTRO_LPM; i++) historial_lpm[i] = 0;
+
+            printf("[ALERTA] Manos fuera del volante. Monitoreo pausado.\n");
+            vTaskDelay(pdMS_TO_TICKS(500)); 
+            continue;
+        }
+
+        // 2. PROCESAMIENTO ANALÓGICO ENTRADA
+        adc_oneshot_read(adc1_handle, CANAL_ADC_PULSO, &lectura_actual);
+
+        suma_filtro_senal -= historial_lecturas[indice_filtro_senal];
+        historial_lecturas[indice_filtro_senal] = lectura_actual;
+        suma_filtro_senal += lectura_actual;
+        indice_filtro_senal = (indice_filtro_senal + 1) % TAMANO_FILTRO_SENAL;
+        linea_base = suma_filtro_senal / TAMANO_FILTRO_SENAL;
+
+        umbral_pico = linea_base + HISTERESIS;
+
+        // 3. DETECCIÓN DE PICOS
+        if (lectura_actual > umbral_pico && !pico_detectado) {
+            tiempo_actual = esp_timer_get_time(); 
+            
+            if (tiempo_ultimo_pico > 0) {
+                intervalo_us = tiempo_actual - tiempo_ultimo_pico;
+                intervalo_segundos = (float)intervalo_us / 1000000.0;
+
+                // Rango biológico macro (40 a 200 LPM)
+                if (intervalo_segundos >= 0.3 && intervalo_segundos <= 1.5) {
+                    lpm_instantaneo = 60.0 / intervalo_segundos;
+
+                    // --- OPCIÓN 3: FILTRO DE VARIACIÓN PORCENTUAL (ANTI-MOVIMIENTO) ---
+                    if (lpm_ultimo_valido > 0.0) {
+                        variacion = fabsf(lpm_instantaneo - lpm_ultimo_valido) / lpm_ultimo_valido;
+                        
+                        if (variacion > MAX_VARIACION_PORCENTUAL) {
+                            // Si varía más del 15% de golpe, es un artefacto de movimiento. Se descarta.
+                            tiempo_ultimo_pico = tiempo_actual;
+                            pico_detectado = true;
+                            vTaskDelay(pdMS_TO_TICKS(20));
+                            continue; 
+                        }
+                    }
+                    
+                    // Si pasó la prueba de variación, se vuelve nuestro nuevo parámetro real
+                    lpm_ultimo_valido = lpm_instantaneo;
+
+                    // --- OPCIÓN 2: PROMEDIO MÓVIL DE SALIDA (SUAVIZADO) ---
+                    suma_filtro_lpm -= historial_lpm[indice_filtro_lpm];
+                    historial_lpm[indice_filtro_lpm] = lpm_instantaneo;
+                    suma_filtro_lpm += lpm_instantaneo;
+                    indice_filtro_lpm = (indice_filtro_lpm + 1) % TAMANO_FILTRO_LPM;
+                    
+                    if (conteo_lpm_validos < TAMANO_FILTRO_LPM) {
+                        conteo_lpm_validos++;
+                    }
+                    
+                    lpm_promediado = suma_filtro_lpm / conteo_lpm_validos;
+
+                    // Imprimir el valor final suavizado y protegido
+                    printf("[MONITOR] Dedo Estable | Pulso: %.1f LPM (Instantáneo: %.1f)\n", lpm_promediado, lpm_instantaneo);
+                }
+            }
+            tiempo_ultimo_pico = tiempo_actual;
+            pico_detectado = true; 
+        } 
+        else if (lectura_actual < linea_base) {
+            pico_detectado = false; 
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20)); 
+    }
+}
