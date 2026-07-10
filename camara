@@ -1,10 +1,46 @@
 import cv2
 import time
-from gpiozero import OutputDevice
+import subprocess
+from gpiozero import OutputDevice, Button
 
-# Configurar el pin GPIO 17 como salida (Inicia en LOW / 0V por defecto)
+# Configurar el pin GPIO 17 como salida a la ESP32 (Inicia en LOW / 0V)
 # Físicamente es el Pin 11 en el cabezal de la Raspberry Pi
 pin_alerta = OutputDevice(17, initial_value=False)
+
+# Configurar el pin GPIO 3 como botón de control multifunción
+# Físicamente es el Pin 5. Conecta el botón entre el Pin 5 y GND (Pin 6)
+# IMPORTANTE: El GPIO 3 es el único pin que permite encender la Pi estando apagada.
+# bounce_time=0.2 añade un anti-rebote por software de 200 milisegundos
+boton_control = Button(3, hold_time=3, bounce_time=0.2) 
+
+sistema_activo = True
+apagando = False
+
+def iniciar_apagado():
+    global apagando
+    apagando = True
+    print("\n=============================================")
+    print("APAGANDO LA RASPBERRY PI DE FORMA SEGURA...")
+    print("Espera a que el LED verde deje de parpadear.")
+    print("Para volver a encender el sistema, solo presiona")
+    print("este mismo botón una vez (estando conectada).")
+    print("=============================================\n")
+    pin_alerta.off()
+    subprocess.call(['sudo', 'poweroff'])
+
+def alternar_estado():
+    global sistema_activo, apagando
+    if not apagando:  # Evitamos acción si ya se ordenó el apagado
+        sistema_activo = not sistema_activo
+        if sistema_activo:
+            print("\n[INFO] Sistema REANUDADO. Monitoreando fatiga...")
+        else:
+            print("\n[INFO] Sistema PAUSADO. Detección detenida.")
+            pin_alerta.off()
+
+# Asignar las acciones al botón físico
+boton_control.when_held = iniciar_apagado
+boton_control.when_released = alternar_estado
 
 # Cargar los modelos de detección
 face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
@@ -21,14 +57,11 @@ if not cap.isOpened():
     print("ERROR: No se pudo iniciar la cámara. Revisa la conexión USB.")
     exit()
 
-print("Sistema SafeShot Iniciado. Monitoreando fatiga... Presiona Ctrl+C para detener.")
+print("Sistema SafeShot Iniciado.")
+print(" -> Toque corto al botón: Pausar / Reanudar detección")
+print(" -> Mantener 3 seg: Apagar la Raspberry de forma segura")
 
 # Variables para control de tiempo exacto
-# NOTA: este cronometro unico cubre DOS situaciones que antes se trataban por separado:
-#   1) Ojos cerrados sostenidos (rostro visible, sin ojos detectados)
-#   2) Rostro no detectado sostenido (cabeza caida, giro brusco, mala iluminacion, etc.)
-# Ambos casos ahora alimentan el MISMO cronometro y activan la MISMA señal HIGH,
-# porque para el ESP32 ambos representan "posible perdida de consciencia del conductor".
 tiempo_inicio_alerta = None
 TIEMPO_ALARMA_SEGUNDOS = 5.0
 
@@ -37,6 +70,13 @@ try:
         ret, frame = cap.read()
         if not ret:
             break
+            
+        if not sistema_activo:
+            # Si el sistema está pausado, leemos la cámara para vaciar el buffer
+            # pero no procesamos la imagen para ahorrar CPU
+            tiempo_inicio_alerta = None
+            time.sleep(0.1)
+            continue
 
         # Convertir a escala de grises
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -46,7 +86,6 @@ try:
 
         if len(faces) > 0:
             # Si hay varios rostros en cuadro, nos quedamos con el mas grande
-            # (asumiendo que es el conductor, el mas cercano a la camara)
             x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
 
             # Recortar la mitad superior del rostro para buscar los ojos
@@ -63,10 +102,7 @@ try:
             tiempo_inicio_alerta = None
             pin_alerta.off()
         else:
-            # No hay evidencia de ojos abiertos: puede ser
-            #  - ojos cerrados (rostro detectado, sin ojos), o
-            #  - rostro no detectado (cabeza caida / girada / perdida)
-            # En ambos casos, el cronometro avanza igual.
+            # No hay evidencia de ojos abiertos
             if tiempo_inicio_alerta is None:
                 tiempo_inicio_alerta = time.time()
             else:
