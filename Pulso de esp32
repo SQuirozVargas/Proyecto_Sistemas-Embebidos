@@ -1,0 +1,101 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+
+MAX30105 pulsoSensor;
+
+#define PIN_SDA 16
+#define PIN_SCL 17
+
+// ================== CONSTANTES DEL FILTRO ==================
+const byte RATE_SIZE           = 4;     // tamaño de la ventana de promediado
+#define BPM_MIN                40       // rango fisiologico minimo
+#define BPM_MAX                180      // rango fisiologico maximo
+#define MAX_VARIACION_BPM      20       // maxima diferencia permitida entre latidos consecutivos
+#define IR_UMBRAL_DEDO         50000    // valor minimo de IR para considerar que hay dedo
+
+// ================== VARIABLES DEL FILTRO ==================
+byte  ritmos[RATE_SIZE];
+byte  ritmoSpot        = 0;
+byte  conteoLatidos    = 0;    // cuantos latidos reales llevamos acumulados (hasta llenar RATE_SIZE)
+long  ultimoLatido     = 0;
+float bpmActual        = 0;    // promedio final, mostrado al usuario
+float ultimoBpmValido  = 0;    // ultimo latido individual aceptado (referencia para el filtro de variacion)
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Iniciando MAX30102...");
+
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  if (!pulsoSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 no detectado. Revisa el cableado.");
+    while (1);
+  }
+
+  Serial.println("MAX30102 encontrado. Coloca el dedo firme y quieto sobre el sensor.");
+
+  pulsoSensor.setup();
+  pulsoSensor.setPulseAmplitudeRed(0x0A);
+  pulsoSensor.setPulseAmplitudeGreen(0);
+}
+
+// Reinicia todo el estado del filtro (se llama cuando se retira el dedo)
+void resetFiltroPulso() {
+  bpmActual       = 0;
+  ultimoBpmValido = 0;
+  conteoLatidos   = 0;
+  ritmoSpot       = 0;
+  for (byte i = 0; i < RATE_SIZE; i++) ritmos[i] = 0;
+}
+
+void loop() {
+  long irValue = pulsoSensor.getIR();
+
+  if (irValue < IR_UMBRAL_DEDO) {
+    Serial.println("Sin dedo detectado");
+    resetFiltroPulso();
+  } else {
+    if (checkForBeat(irValue)) {
+      long delta = millis() - ultimoLatido;
+      ultimoLatido = millis();
+
+      float bpm = 60.0 / (delta / 1000.0);
+
+      // --- Filtro 1: rango fisiologico razonable ---
+      if (bpm > BPM_MIN && bpm < BPM_MAX) {
+
+        // --- Filtro 2: variacion respecto al ultimo latido individual valido ---
+        // (no se compara contra el promedio, para evitar contaminacion con ceros iniciales)
+        if (ultimoBpmValido == 0 || abs(bpm - ultimoBpmValido) < MAX_VARIACION_BPM) {
+
+          ultimoBpmValido = bpm;
+
+          ritmos[ritmoSpot++] = (byte)bpm;
+          ritmoSpot %= RATE_SIZE;
+          if (conteoLatidos < RATE_SIZE) conteoLatidos++;
+
+          // Promedio calculado SOLO sobre los latidos reales acumulados (evita ceros)
+          int suma = 0;
+          for (byte x = 0; x < conteoLatidos; x++) suma += ritmos[x];
+          bpmActual = suma / conteoLatidos;
+
+          Serial.print("IR:"); Serial.print(irValue);
+          Serial.print(" | Nuevo latido! BPM: "); Serial.print(bpm);
+          Serial.print(" | BPM promedio: "); Serial.println(bpmActual);
+
+        } else {
+          Serial.print("IR:"); Serial.print(irValue);
+          Serial.print(" | Latido descartado (variacion muy grande): "); Serial.println(bpm);
+        }
+
+      } else {
+        Serial.print("IR:"); Serial.print(irValue);
+        Serial.print(" | Latido descartado (fuera de rango fisiologico): "); Serial.println(bpm);
+      }
+    }
+  }
+
+  delay(20);
+}
