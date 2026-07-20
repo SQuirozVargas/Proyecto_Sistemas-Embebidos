@@ -1,0 +1,42 @@
+#include <Arduino.h>
+
+// El MQ-2 necesita tiempo de calentamiento (preheat) antes de dar lecturas estables
+#define TIEMPO_CALENTAMIENTO_MS 30000  // 30 segundos minimo
+
+#define PIN_MQ2_DOUT 15   // salida digital (HIGH/LOW segun umbral del potenciometro)
+#define PIN_MQ2_AOUT 34   // salida analogica
+
+unsigned long tiempoInicio;
+bool listoParaLeer = false;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_MQ2_DOUT, INPUT);
+  pinMode(PIN_MQ2_AOUT, INPUT);
+
+  tiempoInicio = millis();
+  Serial.println("Calentando sensor MQ-2, espera 30 segundos...");
+}
+
+void loop() {
+  if (!listoParaLeer) {
+    if (millis() - tiempoInicio >= TIEMPO_CALENTAMIENTO_MS) {
+      listoParaLeer = true;
+      Serial.println("Sensor listo. Puedes acercar el gas de prueba.");
+    } else {
+      Serial.print("Calentando... ");
+      Serial.print((millis() - tiempoInicio) / 1000);
+      Serial.println("s");
+      delay(1000);
+      return;
+    }
+  }
+
+  int valorAnalogico = analogRead(PIN_MQ2_AOUT);
+  bool alertaDigital = (digitalRead(PIN_MQ2_DOUT) == LOW); // ajustar polaridad segun tu modulo
+
+  Serial.print("Analogico: "); Serial.print(valorAnalogico);
+  Serial.print(" | Digital: "); Serial.println(alertaDigital ? "GAS DETECTADO" : "normal");
+
+  delay(300);
+}
