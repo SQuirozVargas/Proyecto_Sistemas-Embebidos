@@ -1,0 +1,63 @@
+#include <Arduino.h>
+#include "DFRobotDFPlayerMini.h"
+
+#define DFPLAYER_RX 18   // el mismo que uso en tu prueba exitosa
+#define DFPLAYER_TX 5
+
+HardwareSerial dfPlayerSerial(1);
+DFRobotDFPlayerMini dfPlayer;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=== Prueba de audio DFPlayer Mini ===");
+
+  dfPlayerSerial.begin(9600, SERIAL_8N1, DFPLAYER_RX, DFPLAYER_TX);
+  delay(1000);
+
+  if (!dfPlayer.begin(dfPlayerSerial)) {
+    Serial.println("Error: no se pudo iniciar el DFPlayer.");
+    while (1);
+  }
+
+  Serial.println("DFPlayer listo. Configurando volumen...");
+  dfPlayer.volume(25);
+  delay(500);
+
+  Serial.println("Reproduciendo pista 0001.mp3...");
+  dfPlayer.play(1);
+}
+
+void loop() {
+  if (dfPlayer.available()) {
+    uint8_t tipo = dfPlayer.readType();
+    int valor = dfPlayer.read();
+
+    switch (tipo) {
+      case DFPlayerPlayFinished:
+        Serial.print("Pista terminada: "); Serial.println(valor);
+        break;
+      case DFPlayerError:
+        Serial.print("Error DFPlayer: "); Serial.println(valor);
+        break;
+      case DFPlayerCardInserted:
+        Serial.println("Tarjeta SD insertada.");
+        break;
+      default:
+        Serial.print("Mensaje tipo: "); Serial.print(tipo);
+        Serial.print(" | valor: "); Serial.println(valor);
+        break;
+    }
+  }
+
+  if (Serial.available()) {
+    String comando = Serial.readStringUntil('\n');
+    comando.trim();
+    int numeroPista = comando.toInt();
+
+    if (numeroPista >= 1 && numeroPista <= 9) {
+      Serial.print("Reproduciendo pista "); Serial.println(numeroPista);
+      dfPlayer.play(numeroPista);
+    }
+  }
+}
