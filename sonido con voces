@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include "DFRobotDFPlayerMini.h"
 
-#define DFPLAYER_RX 18   // el mismo que uso en tu prueba exitosa
+#define DFPLAYER_RX 18
 #define DFPLAYER_TX 5
 
 HardwareSerial dfPlayerSerial(1);
@@ -21,11 +21,13 @@ void setup() {
   }
 
   Serial.println("DFPlayer listo. Configurando volumen...");
-  dfPlayer.volume(25);
+  dfPlayer.volume(30);   // 0-30, ajusta segun necesites
   delay(500);
 
   Serial.println("Reproduciendo pista 0001.mp3...");
   dfPlayer.play(1);
+
+  Serial.println("Escribe un numero del 1 al 9 en el monitor serial para probar cada pista.");
 }
 
 void loop() {
@@ -39,9 +41,6 @@ void loop() {
         break;
       case DFPlayerError:
         Serial.print("Error DFPlayer: "); Serial.println(valor);
-        break;
-      case DFPlayerCardInserted:
-        Serial.println("Tarjeta SD insertada.");
         break;
       default:
         Serial.print("Mensaje tipo: "); Serial.print(tipo);
