@@ -10,12 +10,12 @@
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
- 
+
 MAX30105 pulsoSensor;
- 
+
 #define PIN_SDA 16
 #define PIN_SCL 17
- 
+
 bool  pulsoSensorConectado = false;
 float bpmActual            = 0;
 float ultimoBpmValido      = 0;
@@ -24,7 +24,7 @@ const byte RATE_SIZE = 4;
 byte  ritmos[RATE_SIZE];
 byte  ritmoSpot   = 0;
 long  ultimoLatido = 0;
- 
+
 #define BPM_MIN            40
 #define BPM_MAX            180
 #define MAX_VARIACION_BPM  20
@@ -35,7 +35,7 @@ long  ultimoLatido = 0;
 #define TIEMPO_BPM_CRITICO_MS 5000
 
 unsigned long tiempoBpmCriticoInicio = 0;
- 
+
 // ================== PINES DISPLAY ==================
 #define SEG_A 13
 #define SEG_B 32
@@ -44,47 +44,47 @@ unsigned long tiempoBpmCriticoInicio = 0;
 #define SEG_E 26
 #define SEG_F 25
 #define SEG_G 33
- 
+
 // ================== LEDS ==================
 #define LED_VERDE    23
 #define LED_AMARILLO 22
 #define LED_ROJO     21
- 
+
 // ================== BUZZER ==================
 #define BUZZER     4
 #define LEDC_CANAL 0
- 
+
 // ================== BOTON CANCELAR ==================
 #define BTN_CANCELAR 19
- 
+
 // ================== SENSOR SOMNOLENCIA (Raspberry Pi) ==================
 #define PIN_SOMNOLENCIA 36
 #define TIEMPO_BUZZER_SOMNOLENCIA_MS 3000
- 
+
 // ================== PIEZOS ==================
 #define PIN_PIEZO_IZQ     34
 #define PIN_PIEZO_DER     35
 #define UMBRAL_SENTADO_ON     1000
-#define UMBRAL_SENTADO_OFF     700
+#define UMBRAL_SENTADO_OFF    700
 #define UMBRAL_DESBALANCE_ON   500
 #define UMBRAL_DESBALANCE_OFF  350
 #define TAMANO_FILTRO_PIEZO 8
- 
+
 // ================== SENSOR MANOS EN VOLANTE (IR) ==================
 #define PIN_MANOS_VOLANTE 39
- 
+
 // ================== TIEMPOS ==================
 #define TIEMPO_SIN_MANOS_MS             8000
 #define TIEMPO_BUZZER_MS                8000
 #define TIEMPO_INCLINACION_ALERTA_MS    8000
 #define TIEMPO_INCLINACION_CON_MANOS_MS 30000
- 
-// ================== GEOLOCALIZACION WIFI ==================
-#define MLS_URL "https://location.services.mozilla.com/v1/geolocate?key=test"
- 
+
+// ================== GEOLOCALIZACION GOOGLE MAPS ==================
+const char* GOOGLE_GEOLOCATION_URL = "https://www.googleapis.com/geolocation/v1/geolocate?key=AIzaSyAaVQ8QSqTCIp9P3WfcFVVAY87JNfNzgSg";
+
 double gpsLat = 0.0, gpsLng = 0.0;
 bool   gpsValido = false;
- 
+
 void obtenerUbicacionWiFi() {
   gpsValido = false;
   if (WiFi.status() != WL_CONNECTED) {
@@ -105,12 +105,13 @@ void obtenerUbicacionWiFi() {
     JsonObject punto = puntosAcceso.createNestedObject();
     punto["macAddress"]     = WiFi.BSSIDstr(i);
     punto["signalStrength"] = WiFi.RSSI(i);
+    punto["channel"]        = WiFi.channel(i);
   }
   WiFi.scanDelete();
   String jsonEnvio;
   serializeJson(docEnvio, jsonEnvio);
   HTTPClient http;
-  http.begin(MLS_URL);
+  http.begin(GOOGLE_GEOLOCATION_URL);
   http.addHeader("Content-Type", "application/json");
   http.setTimeout(5000);
   int httpCode = http.POST(jsonEnvio);
@@ -122,58 +123,61 @@ void obtenerUbicacionWiFi() {
       gpsLat    = docRespuesta["location"]["lat"];
       gpsLng    = docRespuesta["location"]["lng"];
       gpsValido = true;
-      Serial.print("[UBICACION] Obtenida: ");
+      Serial.print("[UBICACION] Obtenida con Google: ");
       Serial.print(gpsLat, 6); Serial.print(", "); Serial.println(gpsLng, 6);
     } else {
-      Serial.println("[UBICACION] Error parseando respuesta.");
+      Serial.println("[UBICACION] Error parseando respuesta de Google.");
     }
   } else {
-    Serial.println("[UBICACION] Error consultando Mozilla: " + String(httpCode));
+    Serial.println("[UBICACION] Error consultando Google API: " + String(httpCode));
+    if (httpCode > 0) {
+      Serial.println("[UBICACION] Detalle: " + http.getString());
+    }
   }
   http.end();
 }
- 
+
 // ================== MAQUINA DE ESTADOS ==================
 enum EstadoSistema { VACIO, SENTADO_NORMAL, INCLINADO, ADVERTENCIA_MANOS, EMERGENCIA };
 EstadoSistema estadoActual = VACIO;
- 
+
 hw_timer_t  *timerSensores = NULL;
 portMUX_TYPE timerMux      = portMUX_INITIALIZER_UNLOCKED;
 void IRAM_ATTR onTimerSensores() {}
- 
+
 int    valorPiezoIzq = 0, valorPiezoDer = 0, valorDelta = 0;
 bool   personaSentada = false, inclinacionActiva = false, manosEnVolante = false;
 String dirInclinacion = "Normal";
- 
+
 int  historialPiezoIzq[TAMANO_FILTRO_PIEZO] = {0};
 int  historialPiezoDer[TAMANO_FILTRO_PIEZO] = {0};
 int  idxFiltroPiezo = 0;
 long sumaPiezoIzq = 0, sumaPiezoDer = 0;
- 
+
 unsigned long tiempoSinManos = 0, tiempoInclinacion = 0, tiempoBuzzerInicio = 0;
 unsigned long tiempoBuzzerInclinacion = 0, tiempoInclinacionConManos = 0;
 bool          buzzerAdvertencia = false, buzzerInclinacionActivo = false, avisoPosturaDado = false;
 String        tipoEmergencia = "";
- 
+
 bool          inclinacionIniciada = false;
 unsigned long tiempoSinInclinacion = 0;
 #define TIEMPO_FIN_INCLINACION_MS   500
 unsigned long tiempoSinPresencia = 0;
 #define TIEMPO_FIN_PRESENCIA_MS     500
- 
+
 unsigned long tiempoSomnolenciaInicio = 0, tiempoBuzzerSomnolencia = 0;
 bool          buzzerSomnolenciaActivo = false;
- 
+
 volatile bool emergenciaActiva = false;
 volatile bool cancelado        = false;
 int           contador         = 9;
 unsigned long ultimoTick       = 0;
- 
+
 const bool numeros[10][7] = {
   {0,0,0,0,0,0,1},{1,0,0,1,1,1,1},{0,0,1,0,0,1,0},{0,0,0,0,1,1,0},{1,0,0,1,1,0,0},
   {0,1,0,0,1,0,0},{0,1,0,0,0,0,0},{0,0,0,1,1,1,1},{0,0,0,0,0,0,0},{0,0,0,0,1,0,0}
 };
- 
+
 void mostrarNumero(int n) {
   if (n < 0 || n > 9) return;
   digitalWrite(SEG_A, numeros[n][0]); digitalWrite(SEG_B, numeros[n][1]);
@@ -181,17 +185,17 @@ void mostrarNumero(int n) {
   digitalWrite(SEG_E, numeros[n][4]); digitalWrite(SEG_F, numeros[n][5]);
   digitalWrite(SEG_G, numeros[n][6]);
 }
- 
+
 void apagarDisplay() {
   digitalWrite(SEG_A,HIGH); digitalWrite(SEG_B,HIGH); digitalWrite(SEG_C,HIGH);
   digitalWrite(SEG_D,HIGH); digitalWrite(SEG_E,HIGH); digitalWrite(SEG_F,HIGH);
   digitalWrite(SEG_G,HIGH);
 }
- 
+
 void IRAM_ATTR ISR_cancelar() {
   if (emergenciaActiva) { cancelado = true; emergenciaActiva = false; }
 }
- 
+
 void sonidoCancelacion() {
   ledcWriteTone(LEDC_CANAL,1500); delay(150); ledcWriteTone(LEDC_CANAL,0); delay(200);
   ledcWriteTone(LEDC_CANAL,1000); delay(150); ledcWriteTone(LEDC_CANAL,0); delay(200);
@@ -222,14 +226,14 @@ void sonidoSinPulso() {
   ledcWriteTone(LEDC_CANAL, 300); delay(400); ledcWriteTone(LEDC_CANAL, 0); delay(200);
   ledcWriteTone(LEDC_CANAL, 300); delay(600); ledcWriteTone(LEDC_CANAL, 0);
 }
- 
+
 bool hayInternetReal() {
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClient c; c.setTimeout(2000);
   bool ok = c.connect("api.telegram.org", 443);
   c.stop(); return ok;
 }
- 
+
 String traducirEvento(String tipo) {
   if (tipo == "MANOS_FUERA_VOLANTE") return "El conductor retiro las manos del volante";
   if (tipo == "DESMAYO_DERECHA")     return "Posible desmayo: el conductor se inclino hacia la DERECHA";
@@ -238,26 +242,26 @@ String traducirEvento(String tipo) {
   if (tipo == "BPM_ANORMAL") return "Alerta: se detecto un ritmo cardiaco anormal en el conductor";
   return tipo;
 }
- 
+
 void enviarAlerta() {
   obtenerUbicacionWiFi();
- 
+
   String ubicacion = gpsValido
     ? "https://maps.google.com/?q=" + String(gpsLat,6) + "," + String(gpsLng,6)
     : "Ubicacion no disponible";
- 
+
   String mensajeClaro = traducirEvento(tipoEmergencia);
   String pulsoStr = (bpmActual > 0) ? String((int)bpmActual) + " BPM" : "No detectado";
- 
+
   String msgTelegram = "🚨 ALERTA DE EMERGENCIA 🚨\n\n"
                       + mensajeClaro + "\n\n"
                       + "💓 Pulso: " + pulsoStr + "\n"
                       + "📍 Ubicacion: " + ubicacion;
- 
+
   int direccionNum = 0;
   if (dirInclinacion == "DERECHA") direccionNum = 1;
   else if (dirInclinacion == "IZQUIERDA") direccionNum = -1;
- 
+
   Serial.println("[ALERTA] Verificando conectividad...");
   if (hayInternetReal()) {
     Serial.println("[ALERTA] Enviando por WiFi/Telegram...");
@@ -267,14 +271,14 @@ void enviarAlerta() {
     Serial.println("[ALERTA] Sin internet. No se pudo notificar externamente.");
   }
 }
- 
+
 int filtrarPiezo(int nuevaLectura, int* historial, long* suma) {
   *suma -= historial[idxFiltroPiezo];
   historial[idxFiltroPiezo] = nuevaLectura;
   *suma += nuevaLectura;
   return *suma / TAMANO_FILTRO_PIEZO;
 }
- 
+
 void leerSensores() {
   int rawIzq = analogRead(PIN_PIEZO_IZQ);
   int rawDer = analogRead(PIN_PIEZO_DER);
@@ -282,17 +286,17 @@ void leerSensores() {
   valorPiezoDer = filtrarPiezo(rawDer, historialPiezoDer, &sumaPiezoDer);
   idxFiltroPiezo = (idxFiltroPiezo + 1) % TAMANO_FILTRO_PIEZO;
   valorDelta = valorPiezoDer - valorPiezoIzq;
- 
+
   if (valorPiezoIzq > UMBRAL_SENTADO_ON || valorPiezoDer > UMBRAL_SENTADO_ON) personaSentada = true;
   else if (valorPiezoIzq < UMBRAL_SENTADO_OFF && valorPiezoDer < UMBRAL_SENTADO_OFF) personaSentada = false;
- 
+
   if (valorDelta > UMBRAL_DESBALANCE_ON) { inclinacionActiva = true; dirInclinacion = "DERECHA"; }
   else if (valorDelta < -UMBRAL_DESBALANCE_ON) { inclinacionActiva = true; dirInclinacion = "IZQUIERDA"; }
   else if (abs(valorDelta) < UMBRAL_DESBALANCE_OFF) { inclinacionActiva = false; dirInclinacion = "Normal"; }
- 
+
   manosEnVolante = (digitalRead(PIN_MANOS_VOLANTE) == LOW);
 }
- 
+
 void resetFiltroPulso() {
   bpmActual       = 0;
   ultimoBpmValido = 0;
@@ -300,32 +304,31 @@ void resetFiltroPulso() {
   ritmoSpot       = 0;
   for (byte i = 0; i < RATE_SIZE; i++) ritmos[i] = 0;
 }
- 
 
 void leerPulso() {
   if (!pulsoSensorConectado) return;
- 
+
   long irValue = pulsoSensor.getIR();
- 
+
   if (irValue < IR_UMBRAL_DEDO) {
     resetFiltroPulso();
     return;
   }
- 
+
   if (checkForBeat(irValue)) {
     long delta = millis() - ultimoLatido;
     ultimoLatido = millis();
- 
+
     float bpm = 60.0 / (delta / 1000.0);
- 
+
     if (bpm > BPM_MIN && bpm < BPM_MAX) {
       if (ultimoBpmValido == 0 || abs(bpm - ultimoBpmValido) < MAX_VARIACION_BPM) {
         ultimoBpmValido = bpm;
- 
+
         ritmos[ritmoSpot++] = (byte)bpm;
         ritmoSpot %= RATE_SIZE;
         if (conteoLatidos < RATE_SIZE) conteoLatidos++;
- 
+
         int suma = 0;
         for (byte x = 0; x < conteoLatidos; x++) suma += ritmos[x];
         bpmActual = suma / conteoLatidos;
@@ -333,14 +336,13 @@ void leerPulso() {
     }
   }
 }
- 
+
 void vigilarPulso() {
   if (estadoActual == VACIO || estadoActual == EMERGENCIA) {
     tiempoBpmCriticoInicio = 0;
     return;
   }
 
-  // Solo evaluamos si hay una lectura valida (bpmActual > 0)
   bool bpmAnormal = (bpmActual > 0) && (bpmActual < BPM_CRITICO_BAJO || bpmActual > BPM_CRITICO_ALTO);
 
   if (!bpmAnormal) {
@@ -351,18 +353,18 @@ void vigilarPulso() {
   if (tiempoBpmCriticoInicio == 0) tiempoBpmCriticoInicio = millis();
 
   if (millis() - tiempoBpmCriticoInicio >= TIEMPO_BPM_CRITICO_MS) {
-    sonidoSinPulso(); // reutilizamos el mismo sonido grave distintivo
+    sonidoSinPulso();
     Serial.println("EMERGENCIA: BPM anormal detectado (" + String(bpmActual) + ")");
 
     tipoEmergencia          = "BPM_ANORMAL";
     emergenciaActiva        = true;
     cancelado               = false;
     contador                = 9;
-    estadoActual             = EMERGENCIA;
+    estadoActual            = EMERGENCIA;
     tiempoBpmCriticoInicio  = 0;
   }
 }
- 
+
 void vigilarSomnolencia() {
   if (estadoActual == VACIO || estadoActual == EMERGENCIA) {
     tiempoSomnolenciaInicio = 0; buzzerSomnolenciaActivo = false; return;
@@ -386,7 +388,7 @@ void vigilarSomnolencia() {
     buzzerSomnolenciaActivo = false; tiempoSomnolenciaInicio = 0;
   }
 }
- 
+
 void actualizarEstado() {
   switch (estadoActual) {
     case VACIO:
@@ -396,7 +398,7 @@ void actualizarEstado() {
       inclinacionIniciada = false; buzzerAdvertencia = false; buzzerInclinacionActivo = false; avisoPosturaDado = false;
       if (personaSentada) estadoActual = SENTADO_NORMAL;
       break;
- 
+
     case SENTADO_NORMAL:
       digitalWrite(LED_VERDE, HIGH); digitalWrite(LED_AMARILLO, LOW); digitalWrite(LED_ROJO, LOW);
       apagarDisplay();
@@ -424,7 +426,7 @@ void actualizarEstado() {
         if (millis() - tiempoSinManos >= TIEMPO_SIN_MANOS_MS) estadoActual = ADVERTENCIA_MANOS;
       } else tiempoSinManos = 0;
       break;
- 
+
     case INCLINADO:
       digitalWrite(LED_VERDE, LOW); digitalWrite(LED_AMARILLO, HIGH); digitalWrite(LED_ROJO, LOW);
       if (!personaSentada) {
@@ -463,7 +465,7 @@ void actualizarEstado() {
         if (avisoPosturaDado && millis() - tiempoInclinacionConManos >= TIEMPO_INCLINACION_CON_MANOS_MS) avisoPosturaDado = false;
       } else tiempoInclinacionConManos = 0;
       break;
- 
+
     case ADVERTENCIA_MANOS:
       digitalWrite(LED_VERDE, LOW); digitalWrite(LED_AMARILLO, HIGH); digitalWrite(LED_ROJO, LOW);
       if (!personaSentada) { estadoActual = VACIO; break; }
@@ -481,7 +483,7 @@ void actualizarEstado() {
         emergenciaActiva = true; cancelado = false; contador = 9; estadoActual = EMERGENCIA;
       }
       break;
- 
+
     case EMERGENCIA:
       digitalWrite(LED_VERDE, LOW); digitalWrite(LED_AMARILLO, HIGH); digitalWrite(LED_ROJO, HIGH);
       if (cancelado) {
@@ -512,32 +514,32 @@ void actualizarEstado() {
       break;
   }
 }
- 
+
 void setup() {
   Serial.begin(115200);
- 
+
   pinMode(SEG_A,OUTPUT); pinMode(SEG_B,OUTPUT); pinMode(SEG_C,OUTPUT);
   pinMode(SEG_D,OUTPUT); pinMode(SEG_E,OUTPUT); pinMode(SEG_F,OUTPUT); pinMode(SEG_G,OUTPUT);
   pinMode(LED_VERDE,OUTPUT); pinMode(LED_AMARILLO,OUTPUT); pinMode(LED_ROJO,OUTPUT);
- 
+
   ledcSetup(LEDC_CANAL, 1000, 8);
   ledcAttachPin(BUZZER, LEDC_CANAL);
- 
+
   pinMode(BTN_CANCELAR, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BTN_CANCELAR), ISR_cancelar, FALLING);
- 
+
   pinMode(PIN_PIEZO_IZQ, INPUT);
   pinMode(PIN_PIEZO_DER, INPUT);
   pinMode(PIN_MANOS_VOLANTE, INPUT);
   pinMode(PIN_SOMNOLENCIA, INPUT);
- 
+
   timerSensores = timerBegin(1, 80, true);
   timerAttachInterrupt(timerSensores, &onTimerSensores, true);
   timerAlarmWrite(timerSensores, 10000, true);
   timerAlarmEnable(timerSensores);
- 
+
   Wire.begin(PIN_SDA, PIN_SCL);
- 
+
   if (pulsoSensor.begin(Wire, I2C_SPEED_FAST)) {
     pulsoSensorConectado = true;
     pulsoSensor.setup();
@@ -547,12 +549,12 @@ void setup() {
   } else {
     Serial.println("[PULSO] MAX30102 no detectado, revisa conexion.");
   }
- 
+
   digitalWrite(LED_VERDE, HIGH); digitalWrite(LED_AMARILLO, LOW); digitalWrite(LED_ROJO, LOW);
   apagarDisplay();
- 
+
   intentoconexion("espgroup1", "12341243");
- 
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("[WiFi] Conectado.");
     enviarAlertaTelegram("Sistema iniciado correctamente.");
@@ -560,10 +562,10 @@ void setup() {
   } else {
     Serial.println("[WiFi] No disponible.");
   }
- 
+
   Serial.println("Sistema listo");
 }
- 
+
 void loop() {
   loopAP();
   leerSensores();
@@ -571,7 +573,7 @@ void loop() {
   vigilarPulso();
   vigilarSomnolencia();
   actualizarEstado();
- 
+
   static unsigned long ultimoReporte = 0;
   if (millis() - ultimoReporte >= 100) {
     ultimoReporte = millis();
